@@ -4,10 +4,7 @@ This file tracks current work items for agent sessions. Update this file at the 
 
 ## Current Sprint
 
-### Phase 2: Abstract Policy Module
-
-- [ ] Task 2.1: Create CachePolicy trait (`src/policy.rs`)
-- [ ] Task 2.2: Feature-gate multi-tier code (`src/storage/multi_tier.rs`, `Cargo.toml`)
+<!-- All Phase 1 & Phase 2 tasks complete -->
 
 ## Blocked
 
@@ -19,6 +16,11 @@ This file tracks current work items for agent sessions. Update this file at the 
 
 ## Completed
 
+### Phase 2: Abstract Policy Module
+
+- [x] Task 2.1: Create CachePolicy trait (`src/policy.rs`)
+- [x] Task 2.2: Feature-gate multi-tier code (`Cargo.toml`, `src/storage/multi_tier.rs`)
+
 ### Phase 1: Storage Layer Refactoring
 
 - [x] Task 1.1: Expand CacheMeta with HTTP headers (commit 0d74ff2)
@@ -29,6 +31,34 @@ This file tracks current work items for agent sessions. Update this file at the 
 ---
 
 ## Review
+
+### 2025-11-27 - Phase 2 Complete: Abstract Policy Module
+
+**Done:**
+- Task 2.1: Created CachePolicy trait with `should_cache()` and `max_size()` methods
+- Task 2.1: Implemented NoOpPolicy (always caches, no size limit)
+- Task 2.2: Added `[features]` section to Cargo.toml with `multi-tier` as default feature
+- Task 2.2: Feature-gated `Policy` struct and `Promotion` enum
+- Task 2.2: Feature-gated multi_tier module in storage/mod.rs
+- Task 2.2: Updated lib.rs with conditional re-exports
+
+**Decisions:**
+- CachePolicy trait is always available (generic abstraction)
+- Policy/Promotion only available with multi-tier feature
+- NoOpPolicy defers integration with MemoryStore/DurableTier (future work)
+- parse_content_length() remains ungated as general utility
+
+**Testing:**
+- `cargo build` passes (with multi-tier)
+- `cargo build --no-default-features` passes (without multi-tier)
+- `cargo test` passes (6 tests with multi-tier)
+- `cargo test --no-default-features` passes (4 tests without multi-tier)
+
+**Issues:**
+- Minor unused import warnings when building without multi-tier (expected)
+
+**Next:**
+- Phase 3: Pingora Proxy Integration
 
 ### 2025-11-27 - Phase 1 Complete: Storage Layer Refactoring
 

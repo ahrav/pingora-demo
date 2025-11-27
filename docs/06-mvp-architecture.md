@@ -229,6 +229,28 @@ pub enum CacheDecision {
 }
 ```
 
+### 4.4 Conditional Evaluation Order
+
+- **Problem**: Previous flow ran `matches_conditions` before checking freshness/client directives, causing 304s even when the entry was stale or the client sent `Cache-Control: no-cache`.
+- **Correct order**:
+  1. Fetch metadata/body handle from storage.
+  2. Compute `fresh = now < expires_at` (or created_at + ttl) and `must_revalidate = !fresh || client sent Cache-Control: no-cache`.
+  3. If `must_revalidate`: skip local 304; go to origin with conditional headers (revalidation/stale-if-error path). Serving stale is a separate policy decision, but never emits 304.
+  4. If `fresh` and not `must_revalidate`: evaluate conditionals with RFC ordering—`If-None-Match` (ETag) wins over `If-Modified-Since`; return 304 only when a condition matches, otherwise 200 from cache.
+
+### 4.5 Invalidation vs concurrent fills (gap + mitigation)
+
+- **Current behavior**: `PURGE` deletes the manifest (meta) and then deletes the object. If a miss is already fetching from origin, the in-flight writer will still commit object and meta when it returns, effectively “resurrecting” the just-purged entry.
+- **Race example**:
+  - A starts miss → fetches origin → writes object → writes meta.
+  - While A is in flight, admin issues PURGE → delete meta + object.
+  - A completes and rewrites meta/object → stale copy is back.
+- **MVP mitigation (no generations)**: add a simple CAS guard using a per-key `version`/`epoch`.
+  - Extend `CacheMeta` to carry `version`.
+  - Keep a version counter/tombstone in the index (or a separate KV row).
+  - Lookup/read captures current version; store attempts `put`/`cas_update` only if `version` is unchanged.
+  - PURGE bumps version (or sets tombstone) before deleting, so in-flight fills fail their CAS and drop the write, preventing post-purge resurrection.
+
 ---
 
 ## 5. Request Flows
@@ -255,6 +277,7 @@ GET /image.jpg (not in cache)
 GET /image.jpg
 If-None-Match: "abc123"
 → lookup() returns Fresh { meta.etag = "abc123" }
+→ must_revalidate = false (entry is fresh, no Cache-Control: no-cache)
 → matches_etag() = true
 → CacheDecision::NotModified
 → Return 304 (no body fetch needed)
@@ -265,6 +288,7 @@ If-None-Match: "abc123"
 GET /image.jpg
 If-None-Match: "old-etag"
 → lookup() returns Fresh { meta.etag = "abc123" }
+→ must_revalidate = false (entry is fresh, no Cache-Control: no-cache)
 → matches_etag() = false
 → CacheDecision::ServeFromCache
 → Return 200 with cached body
@@ -272,8 +296,8 @@ If-None-Match: "old-etag"
 
 ### Flow 5: Stale Revalidation - Origin 304
 ```
-GET /image.jpg (stale cache entry)
-→ lookup() returns Stale
+GET /image.jpg (stale entry or client sent Cache-Control: no-cache)
+→ lookup() returns Stale, or Fresh with must_revalidate = true
 → CacheDecision::RevalidateWithOrigin { stale: Some(meta) }
 → upstream_request_filter injects If-None-Match header
 → Origin returns 304
@@ -283,8 +307,8 @@ GET /image.jpg (stale cache entry)
 
 ### Flow 6: Stale Revalidation - Origin 200
 ```
-GET /image.jpg (stale cache entry)
-→ lookup() returns Stale
+GET /image.jpg (stale entry or client sent Cache-Control: no-cache)
+→ lookup() returns Stale, or Fresh with must_revalidate = true
 → CacheDecision::RevalidateWithOrigin { stale: Some(meta) }
 → upstream_request_filter injects If-None-Match header
 → Origin returns 200 with new content
@@ -294,8 +318,8 @@ GET /image.jpg (stale cache entry)
 
 ### Flow 7: Stale-if-error
 ```
-GET /image.jpg (stale cache, origin fails)
-→ lookup() returns Stale
+GET /image.jpg (stale cache or must_revalidate, origin fails)
+→ lookup() returns Stale, or Fresh with must_revalidate = true
 → CacheDecision::RevalidateWithOrigin { stale: Some(meta) }
 → Origin returns 502/timeout
 → response_filter checks stale-if-error in cache_control
@@ -333,9 +357,11 @@ PURGE /image.jpg
 MVP is complete when:
 - [ ] All request flows work correctly
 - [ ] Conditional requests return 304 without body fetch
+- [ ] Cache does not emit 304 when entries are stale or client requests no-cache; ETag takes precedence over If-Modified-Since
 - [ ] Stale entries trigger revalidation with conditional headers
 - [ ] Origin 304 refreshes TTL without re-storing body
 - [ ] Stale-if-error serves stale content on origin failure
+- [ ] PURGE resists post-purge resurrection by guarding writes with a version/epoch CAS
 - [ ] Policy module is abstracted and pluggable (NoOpPolicy for MVP)
 - [ ] Multi-tier code preserved but disabled
 - [ ] Tests pass for all request flow scenarios
