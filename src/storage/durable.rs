@@ -20,41 +20,158 @@ fn map_durable_err(err: DurableError) -> CacheError {
     }
 }
 
-// TODO: Why not provide a const for the capacity?
-// Is there a further optimization of using a buffer pool?
+const VERSION_0_SIZE: usize = 17;
+
 fn serialize_meta(meta: &CacheMeta) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(1 + 8 + 8);
-    match meta.content_length {
-        Some(len) => {
-            buf.push(1);
-            buf.extend_from_slice(&(len as u64).to_be_bytes());
-        }
-        None => {
-            buf.push(0);
-            buf.extend_from_slice(&0u64.to_be_bytes());
-        }
+    let mut buf = Vec::with_capacity(256); // Estimate for new format
+
+    // Version 1 format
+    buf.push(1); // version byte
+
+    // Flags byte
+    let mut flags = 0u8;
+    if meta.content_length.is_some() {
+        flags |= 0b0000_0001; // bit 0
     }
+    if meta.created_at.is_some() {
+        flags |= 0b0000_0010; // bit 1
+    }
+    if meta.expires_at.is_some() {
+        flags |= 0b0000_0100; // bit 2
+    }
+    buf.push(flags);
+
+    // Fixed-size fields
+    buf.extend_from_slice(&meta.content_length.unwrap_or(0).to_be_bytes());
     buf.extend_from_slice(&meta.ttl.as_secs().to_be_bytes());
+    buf.extend_from_slice(&meta.created_at.unwrap_or(0).to_be_bytes());
+    buf.extend_from_slice(&meta.expires_at.unwrap_or(0).to_be_bytes());
+
+    // Variable-length string fields with u16 length prefix
+    let write_optional_string = |buf: &mut Vec<u8>, s: &Option<String>| {
+        if let Some(val) = s {
+            let bytes = val.as_bytes();
+            buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            buf.extend_from_slice(bytes);
+        } else {
+            buf.extend_from_slice(&0u16.to_be_bytes());
+        }
+    };
+
+    write_optional_string(&mut buf, &meta.content_type);
+    write_optional_string(&mut buf, &meta.etag);
+    write_optional_string(&mut buf, &meta.last_modified);
+    write_optional_string(&mut buf, &meta.cache_control);
+
     buf
 }
 
-// TODO: Can we add a const with a decriptive name for 17.
-// Is this the most performant way of filling len_bytes?
-// Is there a more idiomatic way for constructing the CacheMeta?
 fn deserialize_meta(buf: &[u8]) -> CacheMeta {
-    if buf.len() < 17 {
-        return CacheMeta::default();
-    }
-    let flag = buf[0];
-    let mut len_bytes = [0u8; 8];
-    len_bytes.copy_from_slice(&buf[1..9]);
-    let mut ttl_bytes = [0u8; 8];
-    ttl_bytes.copy_from_slice(&buf[9..17]);
+    deserialize_meta_inner(buf).unwrap_or_default()
+}
 
-    let mut meta = CacheMeta::default();
-    meta.content_length = (flag == 1).then_some(u64::from_be_bytes(len_bytes) as usize);
-    meta.ttl = Duration::from_secs(u64::from_be_bytes(ttl_bytes));
-    meta
+fn deserialize_meta_inner(buf: &[u8]) -> Option<CacheMeta> {
+    if buf.is_empty() {
+        return None;
+    }
+
+    // Detect version
+    let version = buf[0];
+
+    if version == 0 || (version == 1 && buf.len() == VERSION_0_SIZE) {
+        // Version 0: old 17-byte format (backward compatibility)
+        if buf.len() < VERSION_0_SIZE {
+            return None;
+        }
+        let flag = buf[0];
+        let mut len_bytes = [0u8; 8];
+        len_bytes.copy_from_slice(&buf[1..9]);
+        let mut ttl_bytes = [0u8; 8];
+        ttl_bytes.copy_from_slice(&buf[9..17]);
+
+        let mut meta = CacheMeta::default();
+        meta.content_length = (flag == 1).then_some(u64::from_be_bytes(len_bytes) as usize);
+        meta.ttl = Duration::from_secs(u64::from_be_bytes(ttl_bytes));
+        return Some(meta);
+    }
+
+    if version != 1 {
+        // Unknown version
+        return None;
+    }
+
+    // Version 1: new extended format
+    let mut pos = 1;
+    if buf.len() < pos + 1 {
+        return None;
+    }
+
+    let flags = buf[pos];
+    pos += 1;
+
+    // Read fixed-size fields (8 bytes each)
+    let read_u64 = |buf: &[u8], pos: &mut usize| -> Option<u64> {
+        if buf.len() < *pos + 8 {
+            return None;
+        }
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&buf[*pos..*pos + 8]);
+        *pos += 8;
+        Some(u64::from_be_bytes(bytes))
+    };
+
+    let content_length_raw = read_u64(buf, &mut pos)?;
+    let ttl_secs = read_u64(buf, &mut pos)?;
+    let created_at_raw = read_u64(buf, &mut pos)?;
+    let expires_at_raw = read_u64(buf, &mut pos)?;
+
+    // Read variable-length strings
+    let read_optional_string = |buf: &[u8], pos: &mut usize| -> Option<Option<String>> {
+        if buf.len() < *pos + 2 {
+            return None;
+        }
+        let mut len_bytes = [0u8; 2];
+        len_bytes.copy_from_slice(&buf[*pos..*pos + 2]);
+        *pos += 2;
+        let len = u16::from_be_bytes(len_bytes) as usize;
+        if len == 0 {
+            return Some(None);
+        }
+        if buf.len() < *pos + len {
+            return None;
+        }
+        let s = String::from_utf8(buf[*pos..*pos + len].to_vec()).ok()?;
+        *pos += len;
+        Some(Some(s))
+    };
+
+    let content_type = read_optional_string(buf, &mut pos)?;
+    let etag = read_optional_string(buf, &mut pos)?;
+    let last_modified = read_optional_string(buf, &mut pos)?;
+    let cache_control = read_optional_string(buf, &mut pos)?;
+
+    Some(CacheMeta {
+        content_length: if flags & 0b0000_0001 != 0 {
+            Some(content_length_raw as usize)
+        } else {
+            None
+        },
+        ttl: Duration::from_secs(ttl_secs),
+        created_at: if flags & 0b0000_0010 != 0 {
+            Some(created_at_raw)
+        } else {
+            None
+        },
+        expires_at: if flags & 0b0000_0100 != 0 {
+            Some(expires_at_raw)
+        } else {
+            None
+        },
+        content_type,
+        etag,
+        last_modified,
+        cache_control,
+    })
 }
 
 // TODO: What is the underlying hasher?
