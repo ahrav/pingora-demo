@@ -3,6 +3,10 @@ name = "pingora-demo"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["multi-tier"]
+multi-tier = []
+
 [dependencies]
 async-trait = "0.1"
 thiserror = "1"

@@ -1,6 +1,6 @@
 use crate::cache::{
-    CacheError, CacheKey, CacheMeta, CacheResult, HitHandler, MissFinishType, MissHandler,
-    PurgeType, Storage,
+    CacheError, CacheKey, CacheMeta, CacheResult, HitHandler, LookupResult, MissFinishType,
+    MissHandler, PurgeType, Storage,
 };
 use crate::storage::traits::{
     BlobRead, BlobStore, BlobWrite, DurableError, DurableResult, IndexStore, Manifest, ObjectId,
@@ -74,10 +74,7 @@ impl MissHandler for MemoryMiss {
 
 #[async_trait]
 impl Storage for MemoryStore {
-    async fn lookup(
-        &self,
-        key: &CacheKey,
-    ) -> CacheResult<Option<(CacheMeta, Box<dyn HitHandler>)>> {
+    async fn lookup(&self, key: &CacheKey) -> CacheResult<LookupResult> {
         let guard = self
             .inner
             .lock()
@@ -87,9 +84,21 @@ impl Storage for MemoryStore {
                 data: Arc::new(data.clone()),
                 cursor: 0,
             };
-            return Ok(Some((meta.clone(), Box::new(hit))));
+            let hit_boxed: Box<dyn HitHandler> = Box::new(hit);
+
+            if meta.is_fresh() {
+                return Ok(LookupResult::Fresh {
+                    meta: meta.clone(),
+                    hit: hit_boxed,
+                });
+            } else {
+                return Ok(LookupResult::Stale {
+                    meta: meta.clone(),
+                    hit: hit_boxed,
+                });
+            }
         }
-        Ok(None)
+        Ok(LookupResult::Miss)
     }
 
     async fn get_miss_handler(

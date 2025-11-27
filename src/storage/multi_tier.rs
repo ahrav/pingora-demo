@@ -1,5 +1,9 @@
+//! Multi-tier cache orchestrator with promotion logic.
+#![cfg(feature = "multi-tier")]
+
 use crate::cache::{
-    CacheKey, CacheMeta, CacheResult, HitHandler, MissFinishType, MissHandler, PurgeType, Storage,
+    CacheKey, CacheMeta, CacheResult, HitHandler, LookupResult, MissFinishType, MissHandler,
+    PurgeType, Storage,
 };
 use crate::policy::{Policy, Promotion, parse_content_length};
 use async_trait::async_trait;
@@ -240,48 +244,105 @@ impl MissHandler for FanoutMiss {
 
 #[async_trait]
 impl Storage for MultiTier {
-    async fn lookup(
-        &self,
-        key: &CacheKey,
-    ) -> CacheResult<Option<(CacheMeta, Box<dyn HitHandler>)>> {
+    async fn lookup(&self, key: &CacheKey) -> CacheResult<LookupResult> {
+        // L0 lookup - return immediately (Fresh/Stale/Miss)
         if let Some(l0) = &self.l0 {
-            if let Some(hit) = l0.lookup(key).await? {
-                return Ok(Some(hit));
+            match l0.lookup(key).await? {
+                LookupResult::Fresh { meta, hit } => {
+                    return Ok(LookupResult::Fresh { meta, hit });
+                }
+                LookupResult::Stale { meta, hit } => {
+                    return Ok(LookupResult::Stale { meta, hit });
+                }
+                LookupResult::Miss => {}
             }
         }
 
+        // L1 lookup - wrap with L0 promotion if needed
         if let Some(l1) = &self.l1 {
-            if let Some((meta, inner)) = l1.lookup(key).await? {
-                let len = parse_content_length(&meta);
-                let mut l0_miss = None;
-                if self.policy.promote_from_l1_to_l0 == Promotion::OnStreamCommitAtFinish {
-                    if let Some(l0) = &self.l0 {
-                        let allow = len.map(|n| n <= self.policy.l0_max).unwrap_or(true);
-                        if allow {
-                            l0_miss = Some(l0.get_miss_handler(key, &meta).await?);
+            match l1.lookup(key).await? {
+                LookupResult::Fresh { meta, hit } | LookupResult::Stale { meta, hit } => {
+                    let len = parse_content_length(&meta);
+                    let mut l0_miss = None;
+                    if self.policy.promote_from_l1_to_l0 == Promotion::OnStreamCommitAtFinish {
+                        if let Some(l0) = &self.l0 {
+                            let allow = len.map(|n| n <= self.policy.l0_max).unwrap_or(true);
+                            if allow {
+                                l0_miss = Some(l0.get_miss_handler(key, &meta).await?);
+                            }
                         }
                     }
+                    let wrapper = HitFromL1PromoteL0 {
+                        inner: hit,
+                        l0_miss,
+                        mode: self.policy.promote_from_l1_to_l0,
+                    };
+                    return Ok(LookupResult::Fresh {
+                        meta,
+                        hit: Box::new(wrapper),
+                    });
                 }
-                let wrapper = HitFromL1PromoteL0 {
-                    inner,
-                    l0_miss,
-                    mode: self.policy.promote_from_l1_to_l0,
-                };
-                return Ok(Some((meta, Box::new(wrapper))));
+                LookupResult::Miss => {}
             }
         }
 
+        // L2 lookup - wrap with L0/L1 promotions
         if let Some(l2) = &self.l2 {
-            if let Some((meta, inner)) = l2.lookup(key).await? {
+            match l2.lookup(key).await? {
+                LookupResult::Fresh { meta, hit } | LookupResult::Stale { meta, hit } => {
+                    let len = parse_content_length(&meta);
+                    let mut wrapper = HitFromLower {
+                        inner: hit,
+                        l0_mode: self.policy.promote_from_l2_to_l0,
+                        l0_miss: None,
+                        l1_mode: self.policy.promote_from_l2_to_l1,
+                        l1_async: None,
+                        l1_lazy_target: None,
+                        l2_mode: Promotion::Never,
+                        l2_async: None,
+                        l2_lazy_target: None,
+                    };
+
+                    if wrapper.l0_mode == Promotion::OnStreamCommitAtFinish {
+                        if let Some(l0) = &self.l0 {
+                            let allow = len.map(|n| n <= self.policy.l0_max).unwrap_or(true);
+                            if allow {
+                                wrapper.l0_miss = Some(l0.get_miss_handler(key, &meta).await?);
+                            }
+                        }
+                    }
+
+                    if wrapper.l1_mode == Promotion::OnStreamCommitAtFinish {
+                        if let Some(l1) = &self.l1 {
+                            let allow = len.map(|n| n <= self.policy.l1_max).unwrap_or(true);
+                            if allow {
+                                wrapper.l1_lazy_target =
+                                    Some((l1.clone(), key.clone(), meta.clone()));
+                            }
+                        }
+                    }
+
+                    return Ok(LookupResult::Fresh {
+                        meta,
+                        hit: Box::new(wrapper),
+                    });
+                }
+                LookupResult::Miss => {}
+            }
+        }
+
+        // L3 lookup - wrap with L0/L1/L2 promotions
+        match self.l3.lookup(key).await? {
+            LookupResult::Fresh { meta, hit } | LookupResult::Stale { meta, hit } => {
                 let len = parse_content_length(&meta);
                 let mut wrapper = HitFromLower {
-                    inner,
-                    l0_mode: self.policy.promote_from_l2_to_l0,
+                    inner: hit,
+                    l0_mode: self.policy.promote_from_l3_to_l0,
                     l0_miss: None,
-                    l1_mode: self.policy.promote_from_l2_to_l1,
+                    l1_mode: self.policy.promote_from_l3_to_l1,
                     l1_async: None,
                     l1_lazy_target: None,
-                    l2_mode: Promotion::Never,
+                    l2_mode: self.policy.promote_from_l3_to_l2,
                     l2_async: None,
                     l2_lazy_target: None,
                 };
@@ -304,55 +365,24 @@ impl Storage for MultiTier {
                     }
                 }
 
-                return Ok(Some((meta, Box::new(wrapper))));
+                if wrapper.l2_mode == Promotion::OnStreamCommitAtFinish {
+                    if let Some(l2) = &self.l2 {
+                        let allow = len.map(|n| n <= self.policy.l2_max).unwrap_or(true);
+                        if allow {
+                            wrapper.l2_lazy_target = Some((l2.clone(), key.clone(), meta.clone()));
+                        }
+                    }
+                }
+
+                return Ok(LookupResult::Fresh {
+                    meta,
+                    hit: Box::new(wrapper),
+                });
             }
+            LookupResult::Miss => {}
         }
 
-        if let Some((meta, inner)) = self.l3.lookup(key).await? {
-            let len = parse_content_length(&meta);
-            let mut wrapper = HitFromLower {
-                inner,
-                l0_mode: self.policy.promote_from_l3_to_l0,
-                l0_miss: None,
-                l1_mode: self.policy.promote_from_l3_to_l1,
-                l1_async: None,
-                l1_lazy_target: None,
-                l2_mode: self.policy.promote_from_l3_to_l2,
-                l2_async: None,
-                l2_lazy_target: None,
-            };
-
-            if wrapper.l0_mode == Promotion::OnStreamCommitAtFinish {
-                if let Some(l0) = &self.l0 {
-                    let allow = len.map(|n| n <= self.policy.l0_max).unwrap_or(true);
-                    if allow {
-                        wrapper.l0_miss = Some(l0.get_miss_handler(key, &meta).await?);
-                    }
-                }
-            }
-
-            if wrapper.l1_mode == Promotion::OnStreamCommitAtFinish {
-                if let Some(l1) = &self.l1 {
-                    let allow = len.map(|n| n <= self.policy.l1_max).unwrap_or(true);
-                    if allow {
-                        wrapper.l1_lazy_target = Some((l1.clone(), key.clone(), meta.clone()));
-                    }
-                }
-            }
-
-            if wrapper.l2_mode == Promotion::OnStreamCommitAtFinish {
-                if let Some(l2) = &self.l2 {
-                    let allow = len.map(|n| n <= self.policy.l2_max).unwrap_or(true);
-                    if allow {
-                        wrapper.l2_lazy_target = Some((l2.clone(), key.clone(), meta.clone()));
-                    }
-                }
-            }
-
-            return Ok(Some((meta, Box::new(wrapper))));
-        }
-
-        Ok(None)
+        Ok(LookupResult::Miss)
     }
 
     async fn get_miss_handler(

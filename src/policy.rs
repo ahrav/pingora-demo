@@ -30,12 +30,14 @@ impl CachePolicy for NoOpPolicy {
     }
 }
 
+#[cfg(feature = "multi-tier")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Promotion {
     Never,
     OnStreamCommitAtFinish,
 }
 
+#[cfg(feature = "multi-tier")]
 #[derive(Clone, Debug)]
 pub struct Policy {
     pub l0_max: usize,
@@ -50,6 +52,7 @@ pub struct Policy {
     pub promote_from_l3_to_l2: Promotion,
 }
 
+#[cfg(feature = "multi-tier")]
 impl Default for Policy {
     fn default() -> Self {
         Self {

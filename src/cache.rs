@@ -115,6 +115,12 @@ impl std::error::Error for CacheError {}
 pub type CacheResult<T> = Result<T, CacheError>;
 pub type StorageRef = Arc<dyn Storage>;
 
+pub enum LookupResult {
+    Fresh { meta: CacheMeta, hit: Box<dyn HitHandler> },
+    Stale { meta: CacheMeta, hit: Box<dyn HitHandler> },
+    Miss,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MissFinishType {
     Success,
@@ -141,8 +147,7 @@ pub trait MissHandler: Send {
 
 #[async_trait]
 pub trait Storage: Send + Sync {
-    async fn lookup(&self, key: &CacheKey)
-    -> CacheResult<Option<(CacheMeta, Box<dyn HitHandler>)>>;
+    async fn lookup(&self, key: &CacheKey) -> CacheResult<LookupResult>;
 
     async fn get_miss_handler(
         &self,

@@ -1,6 +1,6 @@
 use crate::cache::{
-    CacheError, CacheKey, CacheMeta, CacheResult, HitHandler, MissFinishType, MissHandler,
-    PurgeType, Storage,
+    CacheError, CacheKey, CacheMeta, CacheResult, HitHandler, LookupResult, MissFinishType,
+    MissHandler, PurgeType, Storage,
 };
 use crate::storage::traits::{
     BlobRead, BlobStore, BlobWrite, DurableError, IndexStore, Manifest, ObjectId,
@@ -139,29 +139,32 @@ impl<B: BlobStore, I: IndexStore> MissHandler for BlobMiss<B, I> {
 
 #[async_trait]
 impl<B: BlobStore + 'static, I: IndexStore + 'static> Storage for DurableTier<B, I> {
-    async fn lookup(
-        &self,
-        key: &CacheKey,
-    ) -> CacheResult<Option<(CacheMeta, Box<dyn HitHandler>)>> {
+    async fn lookup(&self, key: &CacheKey) -> CacheResult<LookupResult> {
         let manifest = match self.index_store.get(key.as_slice()).await {
             Ok(Some(m)) => m,
-            Ok(None) => return Ok(None),
+            Ok(None) => return Ok(LookupResult::Miss),
             Err(e) => return Err(map_durable_err(e)),
         };
-        if manifest.expires_at <= SystemTime::now() {
-            return Ok(None);
-        }
+
+        let now = SystemTime::now();
         let (obj_meta, reader) = self
             .blob_store
             .get(&manifest.object)
             .await
             .map_err(map_durable_err)?;
+
         let mut meta = deserialize_meta(&manifest.meta_blob);
         if meta.content_length.is_none() {
             meta.content_length = Some(obj_meta.len as usize);
         }
-        let hit = BlobHit { reader };
-        Ok(Some((meta, Box::new(hit))))
+
+        let hit: Box<dyn HitHandler> = Box::new(BlobHit { reader });
+
+        if manifest.expires_at > now {
+            Ok(LookupResult::Fresh { meta, hit })
+        } else {
+            Ok(LookupResult::Stale { meta, hit })
+        }
     }
 
     async fn get_miss_handler(

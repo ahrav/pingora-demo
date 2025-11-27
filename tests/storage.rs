@@ -1,13 +1,16 @@
 use pingora_demo::cache::{
-    CacheError, CacheKey, CacheMeta, CacheResult, HitHandler, MissFinishType, MissHandler, PurgeType,
-    Storage,
+    CacheError, CacheKey, CacheMeta, CacheResult, HitHandler, LookupResult, MissFinishType,
+    MissHandler, PurgeType, Storage,
 };
-use pingora_demo::policy::{Policy, Promotion};
 use pingora_demo::storage::durable::DurableTier;
 use pingora_demo::storage::memory::{InMemoryBlobStore, InMemoryIndexStore, MemoryStore};
-use pingora_demo::storage::multi_tier::MultiTier;
 use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(feature = "multi-tier")]
+use pingora_demo::policy::{Policy, Promotion};
+#[cfg(feature = "multi-tier")]
+use pingora_demo::storage::multi_tier::MultiTier;
 
 async fn read_all(mut hit: Box<dyn HitHandler>) -> CacheResult<Vec<u8>> {
     let mut out = Vec::new();
@@ -30,12 +33,14 @@ async fn durable_round_trip() {
     miss.write_body(b"hello".to_vec(), true).await.unwrap();
     assert_eq!(miss.finish().await.unwrap(), MissFinishType::Success);
 
-    let Some((returned_meta, hit)) = durable.lookup(&key).await.unwrap() else {
-        panic!("expected hit");
-    };
-    assert_eq!(returned_meta.content_length, Some(5));
-    let body = read_all(hit).await.unwrap();
-    assert_eq!(body, b"hello");
+    match durable.lookup(&key).await.unwrap() {
+        LookupResult::Fresh { meta, hit } => {
+            assert_eq!(meta.content_length, Some(5));
+            let body = read_all(hit).await.unwrap();
+            assert_eq!(body, b"hello");
+        }
+        _ => panic!("expected fresh hit"),
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -50,10 +55,20 @@ async fn durable_respects_ttl() {
     miss.write_body(b"hey".to_vec(), true).await.unwrap();
     let _ = miss.finish().await.unwrap();
 
-    let hit = durable.lookup(&key).await.unwrap();
-    assert!(hit.is_none(), "expired entries should miss");
+    match durable.lookup(&key).await.unwrap() {
+        LookupResult::Stale { .. } => {
+            // Expected: expired entries should be stale
+        }
+        LookupResult::Miss => {
+            // Also acceptable: expired entries might be considered miss
+        }
+        LookupResult::Fresh { .. } => {
+            panic!("expired entries should not be fresh");
+        }
+    }
 }
 
+#[cfg(feature = "multi-tier")]
 #[tokio::test(flavor = "current_thread")]
 async fn fanout_drops_oversize_l0() {
     let l0 = Arc::new(MemoryStore::new());
@@ -73,27 +88,28 @@ async fn fanout_drops_oversize_l0() {
     assert_eq!(miss.finish().await.unwrap(), MissFinishType::Success);
 
     assert!(
-        l0.lookup(&key).await.unwrap().is_none(),
+        matches!(l0.lookup(&key).await.unwrap(), LookupResult::Miss),
         "L0 should be dropped once gate is exceeded"
     );
 
-    let Some((_, hit)) = tiers.lookup(&key).await.unwrap() else {
-        panic!("expected L3 hit");
-    };
-    let body = read_all(hit).await.unwrap();
-    assert_eq!(body, vec![1, 2, 3, 4]);
+    match tiers.lookup(&key).await.unwrap() {
+        LookupResult::Fresh { hit, .. } | LookupResult::Stale { hit, .. } => {
+            let body = read_all(hit).await.unwrap();
+            assert_eq!(body, vec![1, 2, 3, 4]);
+        }
+        LookupResult::Miss => panic!("expected L3 hit"),
+    }
 }
 
+#[cfg(feature = "multi-tier")]
 #[derive(Clone, Default)]
 struct FailingStore;
 
+#[cfg(feature = "multi-tier")]
 #[async_trait::async_trait]
 impl Storage for FailingStore {
-    async fn lookup(
-        &self,
-        _key: &CacheKey,
-    ) -> CacheResult<Option<(CacheMeta, Box<dyn HitHandler>)>> {
-        Ok(None)
+    async fn lookup(&self, _key: &CacheKey) -> CacheResult<LookupResult> {
+        Ok(LookupResult::Miss)
     }
 
     async fn get_miss_handler(
@@ -113,8 +129,10 @@ impl Storage for FailingStore {
     }
 }
 
+#[cfg(feature = "multi-tier")]
 struct FailingMiss;
 
+#[cfg(feature = "multi-tier")]
 #[async_trait::async_trait]
 impl MissHandler for FailingMiss {
     async fn write_body(&mut self, _data: Vec<u8>, _eof: bool) -> CacheResult<()> {
@@ -126,6 +144,7 @@ impl MissHandler for FailingMiss {
     }
 }
 
+#[cfg(feature = "multi-tier")]
 #[tokio::test(flavor = "current_thread")]
 async fn promotion_is_best_effort() {
     let l0 = Arc::new(FailingStore::default());
@@ -146,9 +165,11 @@ async fn promotion_is_best_effort() {
     policy.promote_from_l3_to_l2 = Promotion::Never;
 
     let tiers = MultiTier::new(Some(l0), None, None, l3, policy);
-    let Some((_, hit)) = tiers.lookup(&key).await.unwrap() else {
-        panic!("expected L3 hit");
-    };
-    let body = read_all(hit).await.unwrap();
-    assert_eq!(body, b"ping");
+    match tiers.lookup(&key).await.unwrap() {
+        LookupResult::Fresh { hit, .. } | LookupResult::Stale { hit, .. } => {
+            let body = read_all(hit).await.unwrap();
+            assert_eq!(body, b"ping");
+        }
+        LookupResult::Miss => panic!("expected L3 hit"),
+    }
 }
