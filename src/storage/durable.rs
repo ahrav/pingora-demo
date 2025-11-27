@@ -20,8 +20,6 @@ fn map_durable_err(err: DurableError) -> CacheError {
     }
 }
 
-const VERSION_0_SIZE: usize = 17;
-
 fn serialize_meta(meta: &CacheMeta) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256); // Estimate for new format
 
@@ -75,29 +73,9 @@ fn deserialize_meta_inner(buf: &[u8]) -> Option<CacheMeta> {
         return None;
     }
 
-    // Detect version
     let version = buf[0];
-
-    if version == 0 || (version == 1 && buf.len() == VERSION_0_SIZE) {
-        // Version 0: old 17-byte format (backward compatibility)
-        if buf.len() < VERSION_0_SIZE {
-            return None;
-        }
-        let flag = buf[0];
-        let mut len_bytes = [0u8; 8];
-        len_bytes.copy_from_slice(&buf[1..9]);
-        let mut ttl_bytes = [0u8; 8];
-        ttl_bytes.copy_from_slice(&buf[9..17]);
-
-        let mut meta = CacheMeta::default();
-        meta.content_length = (flag == 1).then_some(u64::from_be_bytes(len_bytes) as usize);
-        meta.ttl = Duration::from_secs(u64::from_be_bytes(ttl_bytes));
-        return Some(meta);
-    }
-
     if version != 1 {
-        // Unknown version
-        return None;
+        return None; // Only version 1 supported
     }
 
     // Version 1: new extended format

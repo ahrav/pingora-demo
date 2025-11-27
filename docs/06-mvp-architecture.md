@@ -234,11 +234,11 @@ pub enum CacheDecision {
 - **Problem**: Previous flow ran `matches_conditions` before checking freshness/client directives, causing 304s even when the entry was stale or the client sent `Cache-Control: no-cache`.
 - **Correct order**:
   1. Fetch metadata/body handle from storage.
-  2. Compute `fresh = now < expires_at` (or created_at + ttl) and `must_revalidate = !fresh || client sent Cache-Control: no-cache`.
+  2. Compute `fresh = now < expires_at` (or created_at + ttl) and `must_revalidate = !fresh || (strict_client_no_cache && client sent Cache-Control: no-cache)`. For MVP we default `strict_client_no_cache = false` (trusted downstreams).
   3. If `must_revalidate`: skip local 304; go to origin with conditional headers (revalidation/stale-if-error path). Serving stale is a separate policy decision, but never emits 304.
   4. If `fresh` and not `must_revalidate`: evaluate conditionals with RFC ordering—`If-None-Match` (ETag) wins over `If-Modified-Since`; return 304 only when a condition matches, otherwise 200 from cache.
 
-### 4.5 Invalidation vs concurrent fills (gap + mitigation)
+### 4.5 Invalidation vs concurrent fills 
 
 - **Current behavior**: `PURGE` deletes the manifest (meta) and then deletes the object. If a miss is already fetching from origin, the in-flight writer will still commit object and meta when it returns, effectively “resurrecting” the just-purged entry.
 - **Race example**:
@@ -250,6 +250,14 @@ pub enum CacheDecision {
   - Keep a version counter/tombstone in the index (or a separate KV row).
   - Lookup/read captures current version; store attempts `put`/`cas_update` only if `version` is unchanged.
   - PURGE bumps version (or sets tombstone) before deleting, so in-flight fills fail their CAS and drop the write, preventing post-purge resurrection.
+
+### 4.6 HTTP caching semantics choices
+
+- **Origin Cache-Control: no-store**: always honored—do not write to cache (meta or body).
+- **Client Cache-Control: no-cache**:
+  - Option A (strict HTTP): treat downstream CDNs/clients as untrusted; `no-cache` forces revalidation (`strict_client_no_cache = true`).
+  - Option B (trusted downstreams, MVP default): treat downstreams as trusted; ignore client `Cache-Control` for caching decisions and rely on origin headers + internal invalidations (`strict_client_no_cache = false`).
+  - Rationale: avoids a misconfigured downstream CDN turning off cache globally; can re-enable strict mode via configuration if needed.
 
 ---
 
@@ -296,7 +304,7 @@ If-None-Match: "old-etag"
 
 ### Flow 5: Stale Revalidation - Origin 304
 ```
-GET /image.jpg (stale entry or client sent Cache-Control: no-cache)
+GET /image.jpg (stale entry; in strict mode also client Cache-Control: no-cache)
 → lookup() returns Stale, or Fresh with must_revalidate = true
 → CacheDecision::RevalidateWithOrigin { stale: Some(meta) }
 → upstream_request_filter injects If-None-Match header
@@ -307,7 +315,7 @@ GET /image.jpg (stale entry or client sent Cache-Control: no-cache)
 
 ### Flow 6: Stale Revalidation - Origin 200
 ```
-GET /image.jpg (stale entry or client sent Cache-Control: no-cache)
+GET /image.jpg (stale entry; in strict mode also client Cache-Control: no-cache)
 → lookup() returns Stale, or Fresh with must_revalidate = true
 → CacheDecision::RevalidateWithOrigin { stale: Some(meta) }
 → upstream_request_filter injects If-None-Match header
@@ -362,6 +370,7 @@ MVP is complete when:
 - [ ] Origin 304 refreshes TTL without re-storing body
 - [ ] Stale-if-error serves stale content on origin failure
 - [ ] PURGE resists post-purge resurrection by guarding writes with a version/epoch CAS
+- [ ] Origin Cache-Control: no-store responses are not cached; client Cache-Control: no-cache is ignored by default (configurable strict mode available)
 - [ ] Policy module is abstracted and pluggable (NoOpPolicy for MVP)
 - [ ] Multi-tier code preserved but disabled
 - [ ] Tests pass for all request flow scenarios

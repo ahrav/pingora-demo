@@ -70,20 +70,18 @@ This file tracks current work items for agent sessions. Update this file at the 
 - Task 1.2: Updated all Storage implementations (MemoryStore, DurableTier, MultiTier)
 - Task 1.3: Added touch() method to Storage trait for TTL refresh
 - Task 1.3: Implemented touch() in all storage tiers
-- Task 1.4: Created versioned binary serialization (Version 1 with backward compat for Version 0)
+- Task 1.4: Created versioned binary serialization (Version 1 format)
 - Task 1.4: Added comprehensive tests for all new functionality
 
 **Decisions:**
 - LookupResult treats both Fresh and Stale as promotable hits in MultiTier
 - touch() returns bool (true if key exists and was updated)
 - Serialization uses u16 length prefixes for variable-length strings
-- Version 0 detection: exact 17-byte length or version byte 0
-- All new fields default to None for backward compatibility
+- All new CacheMeta fields default to None
 
 **Testing:**
 - All 6 tests pass (durable_round_trip, durable_respects_ttl, metadata_serialization_roundtrip, touch_extends_ttl, fanout_drops_oversize_l0, promotion_is_best_effort)
-- Verified backward compatibility with old 17-byte format
-- Verified full HTTP header roundtrip with new format
+- Verified full HTTP header roundtrip with Version 1 format
 
 **Issues:**
 - Pre-existing clippy warnings (collapsible_if, type_complexity, field_reassign_with_default)
