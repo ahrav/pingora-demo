@@ -1,5 +1,4 @@
 //! Multi-tier cache orchestrator with promotion logic.
-#![cfg(feature = "multi-tier")]
 
 use crate::cache::{
     CacheKey, CacheMeta, CacheResult, HitHandler, LookupResult, MissFinishType, MissHandler,
@@ -463,6 +462,21 @@ impl Storage for MultiTier {
             any |= l2.update_meta(key, meta).await.unwrap_or(false);
         }
         any |= self.l3.update_meta(key, meta).await.unwrap_or(false);
+        Ok(any)
+    }
+
+    async fn touch(&self, key: &CacheKey, new_expiry: u64) -> CacheResult<bool> {
+        let mut any = false;
+        if let Some(l0) = &self.l0 {
+            any |= l0.touch(key, new_expiry).await.unwrap_or(false);
+        }
+        if let Some(l1) = &self.l1 {
+            any |= l1.touch(key, new_expiry).await.unwrap_or(false);
+        }
+        if let Some(l2) = &self.l2 {
+            any |= l2.touch(key, new_expiry).await.unwrap_or(false);
+        }
+        any |= self.l3.touch(key, new_expiry).await.unwrap_or(false);
         Ok(any)
     }
 }

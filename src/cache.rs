@@ -158,4 +158,6 @@ pub trait Storage: Send + Sync {
     async fn purge(&self, key: &CacheKey, typ: PurgeType) -> CacheResult<bool>;
 
     async fn update_meta(&self, key: &CacheKey, meta: &CacheMeta) -> CacheResult<bool>;
+
+    async fn touch(&self, key: &CacheKey, new_expiry: u64) -> CacheResult<bool>;
 }

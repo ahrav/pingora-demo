@@ -224,4 +224,13 @@ impl<B: BlobStore + 'static, I: IndexStore + 'static> Storage for DurableTier<B,
             Err(e) => Err(map_durable_err(e)),
         }
     }
+
+    async fn touch(&self, key: &CacheKey, new_expiry: u64) -> CacheResult<bool> {
+        let new_expiry_time = SystemTime::UNIX_EPOCH + Duration::from_secs(new_expiry);
+        self.index_store
+            .touch_ttl(key.as_slice(), new_expiry_time)
+            .await
+            .map_err(map_durable_err)?;
+        Ok(true)
+    }
 }

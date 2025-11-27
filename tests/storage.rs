@@ -68,6 +68,40 @@ async fn durable_respects_ttl() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn touch_extends_ttl() {
+    let store = MemoryStore::new();
+    let key = CacheKey::from("touchable");
+    let meta = CacheMeta::new(Some(4), Duration::from_secs(60));
+
+    // Write initial entry
+    let mut miss = store.get_miss_handler(&key, &meta).await.unwrap();
+    miss.write_body(b"data".to_vec(), true).await.unwrap();
+    let _ = miss.finish().await.unwrap();
+
+    // Verify it's fresh
+    match store.lookup(&key).await.unwrap() {
+        LookupResult::Fresh { .. } => {}
+        _ => panic!("expected fresh entry"),
+    }
+
+    // Touch with new expiry far in the future
+    let new_expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    assert!(store.touch(&key, new_expiry).await.unwrap());
+
+    // Verify still fresh
+    match store.lookup(&key).await.unwrap() {
+        LookupResult::Fresh { meta, .. } => {
+            assert_eq!(meta.expires_at, Some(new_expiry));
+        }
+        _ => panic!("expected fresh entry after touch"),
+    }
+}
+
 #[cfg(feature = "multi-tier")]
 #[tokio::test(flavor = "current_thread")]
 async fn fanout_drops_oversize_l0() {
@@ -125,6 +159,10 @@ impl Storage for FailingStore {
     }
 
     async fn update_meta(&self, _key: &CacheKey, _meta: &CacheMeta) -> CacheResult<bool> {
+        Ok(false)
+    }
+
+    async fn touch(&self, _key: &CacheKey, _new_expiry: u64) -> CacheResult<bool> {
         Ok(false)
     }
 }

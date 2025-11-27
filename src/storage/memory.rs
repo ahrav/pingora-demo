@@ -134,6 +134,19 @@ impl Storage for MemoryStore {
             Ok(false)
         }
     }
+
+    async fn touch(&self, key: &CacheKey, new_expiry: u64) -> CacheResult<bool> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| CacheError::Backend("mutex poisoned".into()))?;
+        if let Some(entry) = guard.get_mut(key) {
+            entry.0.expires_at = Some(new_expiry);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 /* ---------- In-memory blob and index stores for DurableTier ---------- */
