@@ -1,0 +1,62 @@
+flowchart TB
+    subgraph PingoraAPI[Pingora Cache API]
+        StorageTrait[Storage Trait<br/>lookup / get_miss_handler<br/>purge / update_meta]
+    end
+    
+    subgraph L3Impl[L3: DurableTier&lt;B, I&gt;]
+        DurableTier[DurableTier<br/>Implements Storage]
+    end
+    
+    subgraph Traits[Storage Abstraction Traits]
+        BlobStoreTrait[BlobStore Trait<br/>get / put / delete / head<br/>Streaming multipart upload]
+        IndexStoreTrait[IndexStore Trait<br/>get / put_new / cas_update<br/>delete / touch_ttl<br/>CAS with version control]
+    end
+    
+    subgraph BlobImpls[BlobStore Implementations]
+        S3Blob[S3Blob<br/>AWS S3<br/>Multipart upload<br/>ByteStream]
+        MinIOBlob[MinIOBlob<br/>MinIO<br/>S3-compatible]
+        CephBlob[CephBlob<br/>Ceph RGW<br/>S3-compatible]
+        LocalBlob[LocalFSBlob<br/>Local filesystem<br/>Testing/dev]
+    end
+    
+    subgraph IndexImpls[IndexStore Implementations]
+        DdbIndex[DdbIndex<br/>DynamoDB<br/>Conditional writes<br/>TTL native]
+        CrdbIndex[CrdbIndex<br/>CockroachDB<br/>SQL transactions<br/>Global consistency]
+        RedisIndex[RedisIndex<br/>Redis<br/>Fast KV<br/>WATCH/MULTI]
+    end
+    
+    subgraph Data[Data Model]
+        Manifest[Manifest<br/>• object: ObjectId<br/>• len: u64<br/>• etag: String<br/>• meta_blob: Vec&lt;u8&gt;<br/>• expires_at: SystemTime<br/>• version: u64]
+        ObjectId[ObjectId<br/>• bucket: String<br/>• key: String]
+    end
+    
+    StorageTrait -->|implements| DurableTier
+    DurableTier -->|uses| BlobStoreTrait
+    DurableTier -->|uses| IndexStoreTrait
+    
+    BlobStoreTrait -.->|impl| S3Blob
+    BlobStoreTrait -.->|impl| MinIOBlob
+    BlobStoreTrait -.->|impl| CephBlob
+    BlobStoreTrait -.->|impl| LocalBlob
+    
+    IndexStoreTrait -.->|impl| DdbIndex
+    IndexStoreTrait -.->|impl| CrdbIndex
+    IndexStoreTrait -.->|impl| RedisIndex
+    
+    IndexStoreTrait -->|stores| Manifest
+    Manifest -->|references| ObjectId
+    BlobStoreTrait -->|fetches via| ObjectId
+    
+    style StorageTrait fill:#FFD700
+    style DurableTier fill:#F08080
+    style BlobStoreTrait fill:#87CEEB
+    style IndexStoreTrait fill:#87CEEB
+    style S3Blob fill:#90EE90
+    style MinIOBlob fill:#90EE90
+    style CephBlob fill:#90EE90
+    style LocalBlob fill:#90EE90
+    style DdbIndex fill:#DDA0DD
+    style CrdbIndex fill:#DDA0DD
+    style RedisIndex fill:#DDA0DD
+    style Manifest fill:#FFE4B5
+    style ObjectId fill:#FFE4B5

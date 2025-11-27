@@ -1,0 +1,70 @@
+sequenceDiagram
+    participant Client
+    participant Pingora
+    participant L0
+    participant L1
+    participant L2
+    participant L3
+    
+    Note over Client,L3: Scenario: Warm L3, cold upper tiers<br/>(L3 DurableTier HIT with promotions)
+    
+    Client->>Pingora: GET /image.jpg
+    activate Pingora
+    
+    Pingora->>L0: lookup(key)
+    L0-->>Pingora: None (miss)
+    
+    Pingora->>L1: lookup(key)
+    L1-->>Pingora: None (miss)
+    
+    Pingora->>L2: lookup(key)
+    L2-->>Pingora: None (miss)
+    
+    Pingora->>L3: lookup(key)
+    activate L3
+    L3-->>Pingora: HIT (meta, handler)
+    deactivate L3
+    
+    Note over Pingora: Wrap with HitFromLower<br/>L3→L0: sync ✓<br/>L3→L1: async ✓<br/>L3→L2: async ✓
+    
+    loop Stream from L3
+        Pingora->>L3: read_body()
+        activate L3
+        L3-->>Pingora: chunk
+        deactivate L3
+        
+        par Promotions during read
+            Pingora->>L0: write_body(chunk)
+            Note over L0: Synchronous
+            L0-->>Pingora: ok
+        and
+            Pingora->>L1: tx.try_send(chunk)
+            Note over L1: Async worker<br/>Non-blocking
+            L1->>L1: write_body
+        and
+            Pingora->>L2: tx.try_send(chunk)
+            Note over L2: Async worker<br/>Non-blocking
+            L2->>L2: write_body
+        end
+        
+        Pingora-->>Client: chunk
+    end
+    
+    Pingora->>L3: finish()
+    activate L3
+    L3-->>Pingora: ok
+    deactivate L3
+    
+    par Finalize promotions
+        Pingora->>L0: finish()
+        L0-->>Pingora: ok
+    and
+        Note over L1: Close channel & await
+        L1->>L1: finish()
+    and
+        Note over L2: Close channel & await
+        L2->>L2: finish()
+    end
+    
+    Pingora-->>Client: complete
+    deactivate Pingora

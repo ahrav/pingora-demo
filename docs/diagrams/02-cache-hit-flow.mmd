@@ -1,0 +1,79 @@
+flowchart TD
+    Start([Lookup Request])
+    
+    CheckL0{Check L0}
+    L0Hit[L0 HIT<br/>Return immediately<br/>No promotion needed]
+    
+    CheckL1{Check L1}
+    L1Hit[L1 HIT]
+    L1Policy{promote_from_l1_to_l0<br/>enabled?}
+    L1Size{size ≤ l0_max?}
+    L1Promote[Wrap: HitFromL1PromoteL0<br/>Stream to L0 during read_body<br/>Commit at finish sync]
+    L1Return[Return L1 data<br/>No promotion]
+    
+    CheckL2{Check L2}
+    L2Hit[L2 HIT]
+    L2Wrapper[Wrap: HitFromLower]
+    L2CheckL0{promote_from_l2_to_l0?}
+    L2CheckL1{promote_from_l2_to_l1?}
+    L2L0Sync[L0: Sync promotion<br/>during read_body]
+    L2L1Async[L1: Async lazy worker<br/>bounded channel 64]
+    L2Return[Return L2 data]
+    
+    CheckL3{Check L3}
+    L3Hit[L3 HIT]
+    L3Wrapper[Wrap: HitFromLower]
+    L3CheckL0{promote_from_l3_to_l0?}
+    L3CheckL1{promote_from_l3_to_l1?}
+    L3CheckL2{promote_from_l3_to_l2?}
+    L3L0[L0: Sync]
+    L3L1[L1: Async lazy]
+    L3L2[L2: Async lazy]
+    L3Return[Return L3 data]
+    
+    Miss[MISS<br/>Fetch from origin]
+    
+    Start --> CheckL0
+    CheckL0 -->|Hit| L0Hit
+    CheckL0 -->|Miss| CheckL1
+    
+    CheckL1 -->|Hit| L1Hit
+    L1Hit --> L1Policy
+    L1Policy -->|Yes| L1Size
+    L1Policy -->|No| L1Return
+    L1Size -->|Yes| L1Promote
+    L1Size -->|No| L1Return
+    CheckL1 -->|Miss| CheckL2
+    
+    CheckL2 -->|Hit| L2Hit
+    L2Hit --> L2Wrapper
+    L2Wrapper --> L2CheckL0
+    L2CheckL0 -->|Yes & size OK| L2L0Sync
+    L2CheckL0 -->|No| L2CheckL1
+    L2L0Sync --> L2CheckL1
+    L2CheckL1 -->|Yes & size OK| L2L1Async
+    L2CheckL1 -->|No| L2Return
+    L2L1Async --> L2Return
+    CheckL2 -->|Miss| CheckL3
+    
+    CheckL3 -->|Hit| L3Hit
+    L3Hit --> L3Wrapper
+    L3Wrapper --> L3CheckL0
+    L3CheckL0 -->|Yes & size OK| L3L0
+    L3CheckL0 -->|No| L3CheckL1
+    L3L0 --> L3CheckL1
+    L3CheckL1 -->|Yes & size OK| L3L1
+    L3CheckL1 -->|No| L3CheckL2
+    L3L1 --> L3CheckL2
+    L3CheckL2 -->|Yes & size OK| L3L2
+    L3CheckL2 -->|No| L3Return
+    L3L2 --> L3Return
+    CheckL3 -->|Miss| Miss
+    
+    style L0Hit fill:#90EE90
+    style L1Promote fill:#87CEEB
+    style L2L0Sync fill:#90EE90
+    style L2L1Async fill:#87CEEB
+    style L3L0 fill:#90EE90
+    style L3L1 fill:#87CEEB
+    style L3L2 fill:#DDA0DD

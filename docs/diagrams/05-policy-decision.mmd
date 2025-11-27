@@ -1,0 +1,98 @@
+flowchart TD
+    Start([Policy Evaluation])
+    
+    subgraph Gates["Size Gates: Admission Control"]
+        ContentLen{Content-Length<br/>known?}
+        UnknownAdmit[Admit optimistically<br/>Enforce gate during streaming]
+        KnownSize[size = Content-Length]
+        
+        CheckL0Gate{size > l0_max<br/>2MB?}
+        CheckL1Gate{size > l1_max<br/>64MB?}
+        CheckL2Gate{size > l2_max<br/>unlimited?}
+        
+        AdmitL0[✓ Can admit to L0]
+        SkipL0[✗ Skip L0]
+        AdmitL1[✓ Can admit to L1]
+        SkipL1[✗ Skip L1]
+        AdmitL2[✓ Can admit to L2]
+        SkipL2[✗ Skip L2]
+        AdmitL3[✓ Always admit to L3]
+    end
+    
+    subgraph Promos["Promotion Policies"]
+        PromL1L0[promote_from_l1_to_l0]
+        PromL2L0[promote_from_l2_to_l0]
+        PromL2L1[promote_from_l2_to_l1]
+        PromL3L0[promote_from_l3_to_l0]
+        PromL3L1[promote_from_l3_to_l1]
+        PromL3L2[promote_from_l3_to_l2]
+        
+        Never1[Never: No promotion]
+        Stream1[OnStreamCommitAtFinish:<br/>Promote during read]
+        
+        Never2[Never]
+        Stream2[OnStreamCommitAtFinish]
+        
+        Never3[Never]
+        Stream3[OnStreamCommitAtFinish]
+        
+        Never4[Never]
+        Stream4[OnStreamCommitAtFinish]
+        
+        Never5[Never]
+        Stream5[OnStreamCommitAtFinish]
+        
+        Never6[Never]
+        Stream6[OnStreamCommitAtFinish]
+    end
+    
+    Start --> ContentLen
+    
+    ContentLen -->|No| UnknownAdmit
+    ContentLen -->|Yes| KnownSize
+    
+    KnownSize --> CheckL0Gate
+    CheckL0Gate -->|Yes| SkipL0
+    CheckL0Gate -->|No| AdmitL0
+    
+    SkipL0 --> CheckL1Gate
+    AdmitL0 --> CheckL1Gate
+    CheckL1Gate -->|Yes| SkipL1
+    CheckL1Gate -->|No| AdmitL1
+    
+    SkipL1 --> CheckL2Gate
+    AdmitL1 --> CheckL2Gate
+    CheckL2Gate -->|Yes| SkipL2
+    CheckL2Gate -->|No| AdmitL2
+    
+    SkipL2 --> AdmitL3
+    AdmitL2 --> AdmitL3
+    
+    PromL1L0 -->|Never| Never1
+    PromL1L0 -->|OnStreamCommitAtFinish| Stream1
+    
+    PromL2L0 -->|Never| Never2
+    PromL2L0 -->|OnStreamCommitAtFinish| Stream2
+    
+    PromL2L1 -->|Never| Never3
+    PromL2L1 -->|OnStreamCommitAtFinish| Stream3
+    
+    PromL3L0 -->|Never| Never4
+    PromL3L0 -->|OnStreamCommitAtFinish| Stream4
+    
+    PromL3L1 -->|Never| Never5
+    PromL3L1 -->|OnStreamCommitAtFinish| Stream5
+    
+    PromL3L2 -->|Never| Never6
+    PromL3L2 -->|OnStreamCommitAtFinish| Stream6
+    
+    style AdmitL0 fill:#90EE90
+    style AdmitL1 fill:#87CEEB
+    style AdmitL2 fill:#DDA0DD
+    style AdmitL3 fill:#F08080
+    style Stream1 fill:#90EE90
+    style Stream2 fill:#90EE90
+    style Stream3 fill:#87CEEB
+    style Stream4 fill:#90EE90
+    style Stream5 fill:#87CEEB
+    style Stream6 fill:#DDA0DD

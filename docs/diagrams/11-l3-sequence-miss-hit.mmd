@@ -1,0 +1,105 @@
+sequenceDiagram
+    participant Pingora
+    participant L3 as DurableTier
+    participant Index as IndexStore<br/>(DynamoDB/CockroachDB)
+    participant Blob as BlobStore<br/>(S3/MinIO)
+    participant Origin
+    
+    Note over Pingora,Origin: Phase 1: Cache MISS - Origin Fetch
+    
+    Pingora->>L3: lookup(key)
+    activate L3
+    L3->>Index: get(key)
+    activate Index
+    Index-->>L3: None (not found)
+    deactivate Index
+    L3-->>Pingora: None (miss)
+    deactivate L3
+    
+    Pingora->>Origin: GET /resource
+    activate Origin
+    Origin-->>Pingora: Response + CacheMeta
+    deactivate Origin
+    
+    Pingora->>L3: get_miss_handler(key, meta)
+    activate L3
+    
+    Note over L3: Generate ObjectId<br/>hash(key) → blob key
+    
+    L3->>Blob: put(ObjectId)
+    activate Blob
+    Blob-->>L3: BlobWrite handle
+    deactivate Blob
+    
+    L3-->>Pingora: BlobMiss handler
+    deactivate L3
+    
+    loop Stream body chunks
+        Pingora->>L3: write_body(chunk)
+        activate L3
+        L3->>Blob: writer.write(chunk)
+        activate Blob
+        Note over Blob: Buffer to 5MB<br/>Upload parts async
+        Blob-->>L3: ok
+        deactivate Blob
+        L3-->>Pingora: ok
+        deactivate L3
+    end
+    
+    Pingora->>L3: finish()
+    activate L3
+    
+    L3->>Blob: writer.complete()
+    activate Blob
+    Note over Blob: Complete multipart<br/>Finalize object
+    Blob-->>L3: ObjectMeta (etag, len)
+    deactivate Blob
+    
+    Note over L3: Build Manifest:<br/>• ObjectId<br/>• serialize(CacheMeta)<br/>• expires_at = now + TTL<br/>• version = 0
+    
+    L3->>Index: put_new(key, manifest)
+    activate Index
+    Note over Index: Atomic conditional:<br/>INSERT if not exists
+    Index-->>L3: version 1 (success)
+    deactivate Index
+    
+    L3-->>Pingora: Success
+    deactivate L3
+    
+    Note over Pingora,Origin: Phase 2: Cache HIT - Subsequent Request
+    
+    Pingora->>L3: lookup(key)
+    activate L3
+    
+    L3->>Index: get(key)
+    activate Index
+    Index-->>L3: Manifest<br/>(ObjectId, meta_blob, TTL)
+    deactivate Index
+    
+    Note over L3: Check TTL valid<br/>Deserialize CacheMeta
+    
+    L3->>Blob: get(ObjectId, range=None)
+    activate Blob
+    Blob-->>L3: (ObjectMeta, Stream)
+    deactivate Blob
+    
+    Note over L3: Wrap stream in BlobHit
+    
+    L3-->>Pingora: (CacheMeta, HitHandler)
+    deactivate L3
+    
+    loop Stream cached body
+        Pingora->>L3: read_body()
+        activate L3
+        L3->>Blob: stream.next()
+        activate Blob
+        Blob-->>L3: chunk
+        deactivate Blob
+        L3-->>Pingora: chunk
+        deactivate L3
+    end
+    
+    Pingora->>L3: finish()
+    activate L3
+    L3-->>Pingora: ok
+    deactivate L3
