@@ -189,6 +189,246 @@ pub fn matches_etag(stored_etag: &str, if_none_match: &str) -> bool {
 }
 
 // =============================================================================
+// If-Modified-Since Conditional Matching (RFC 7232)
+// =============================================================================
+
+/// Parse an HTTP-date string into a Unix timestamp.
+///
+/// Supports the three HTTP date formats per RFC 7231 Section 7.1.1.1:
+/// - IMF-fixdate: `Sun, 06 Nov 1994 08:49:37 GMT` (preferred)
+/// - RFC 850: `Sunday, 06-Nov-94 08:49:37 GMT` (obsolete)
+/// - asctime: `Sun Nov  6 08:49:37 1994` (obsolete)
+///
+/// Returns `None` if the date cannot be parsed.
+pub fn parse_http_date(s: &str) -> Option<u64> {
+    let s = s.trim();
+
+    // Try IMF-fixdate first (most common): "Sun, 06 Nov 1994 08:49:37 GMT"
+    if let Some(ts) = parse_imf_fixdate(s) {
+        return Some(ts);
+    }
+
+    // Try RFC 850 format: "Sunday, 06-Nov-94 08:49:37 GMT"
+    if let Some(ts) = parse_rfc850_date(s) {
+        return Some(ts);
+    }
+
+    // Try asctime format: "Sun Nov  6 08:49:37 1994"
+    if let Some(ts) = parse_asctime_date(s) {
+        return Some(ts);
+    }
+
+    None
+}
+
+/// Parse IMF-fixdate format: "Sun, 06 Nov 1994 08:49:37 GMT"
+fn parse_imf_fixdate(s: &str) -> Option<u64> {
+    // Format: "Day, DD Mon YYYY HH:MM:SS GMT"
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() != 6 || parts[5] != "GMT" {
+        return None;
+    }
+
+    // parts[0] = "Sun," (day-name with comma)
+    // parts[1] = "06" (day)
+    // parts[2] = "Nov" (month)
+    // parts[3] = "1994" (year)
+    // parts[4] = "08:49:37" (time)
+    // parts[5] = "GMT"
+
+    let day: u32 = parts[1].parse().ok()?;
+    let month = month_from_str(parts[2])?;
+    let year: i32 = parts[3].parse().ok()?;
+    let (hour, min, sec) = parse_time(parts[4])?;
+
+    timestamp_from_components(year, month, day, hour, min, sec)
+}
+
+/// Parse RFC 850 format: "Sunday, 06-Nov-94 08:49:37 GMT"
+fn parse_rfc850_date(s: &str) -> Option<u64> {
+    // Format: "Dayname, DD-Mon-YY HH:MM:SS GMT"
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() != 4 || parts[3] != "GMT" {
+        return None;
+    }
+
+    // parts[0] = "Sunday," (day-name with comma)
+    // parts[1] = "06-Nov-94" (date)
+    // parts[2] = "08:49:37" (time)
+    // parts[3] = "GMT"
+
+    let date_parts: Vec<&str> = parts[1].split('-').collect();
+    if date_parts.len() != 3 {
+        return None;
+    }
+
+    let day: u32 = date_parts[0].parse().ok()?;
+    let month = month_from_str(date_parts[1])?;
+    let year_short: i32 = date_parts[2].parse().ok()?;
+
+    // Convert 2-digit year: 00-99 -> assume 1970-2069 range
+    let year = if year_short >= 70 {
+        1900 + year_short
+    } else {
+        2000 + year_short
+    };
+
+    let (hour, min, sec) = parse_time(parts[2])?;
+
+    timestamp_from_components(year, month, day, hour, min, sec)
+}
+
+/// Parse asctime format: "Sun Nov  6 08:49:37 1994"
+fn parse_asctime_date(s: &str) -> Option<u64> {
+    // Format: "Day Mon DD HH:MM:SS YYYY" (DD may have leading space)
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() != 5 {
+        return None;
+    }
+
+    // parts[0] = "Sun" (day-name)
+    // parts[1] = "Nov" (month)
+    // parts[2] = "6" (day, no leading zero)
+    // parts[3] = "08:49:37" (time)
+    // parts[4] = "1994" (year)
+
+    let month = month_from_str(parts[1])?;
+    let day: u32 = parts[2].parse().ok()?;
+    let (hour, min, sec) = parse_time(parts[3])?;
+    let year: i32 = parts[4].parse().ok()?;
+
+    timestamp_from_components(year, month, day, hour, min, sec)
+}
+
+/// Parse time string "HH:MM:SS" into components.
+fn parse_time(s: &str) -> Option<(u32, u32, u32)> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let hour: u32 = parts[0].parse().ok()?;
+    let min: u32 = parts[1].parse().ok()?;
+    let sec: u32 = parts[2].parse().ok()?;
+
+    // Validate ranges
+    if hour > 23 || min > 59 || sec > 60 {
+        // sec can be 60 for leap seconds
+        return None;
+    }
+
+    Some((hour, min, sec))
+}
+
+/// Convert month abbreviation to 1-based month number.
+fn month_from_str(s: &str) -> Option<u32> {
+    match s.to_ascii_lowercase().as_str() {
+        "jan" => Some(1),
+        "feb" => Some(2),
+        "mar" => Some(3),
+        "apr" => Some(4),
+        "may" => Some(5),
+        "jun" => Some(6),
+        "jul" => Some(7),
+        "aug" => Some(8),
+        "sep" => Some(9),
+        "oct" => Some(10),
+        "nov" => Some(11),
+        "dec" => Some(12),
+        _ => None,
+    }
+}
+
+/// Convert date/time components to Unix timestamp.
+///
+/// Uses a simplified algorithm that handles dates from 1970 onwards.
+fn timestamp_from_components(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    min: u32,
+    sec: u32,
+) -> Option<u64> {
+    // Validate basic ranges
+    if year < 1970 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    // Days in each month (non-leap year)
+    const DAYS_IN_MONTH: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+    // Check if leap year
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let max_day = if month == 2 && is_leap {
+        29
+    } else {
+        DAYS_IN_MONTH[(month - 1) as usize]
+    };
+
+    if day > max_day {
+        return None;
+    }
+
+    // Calculate days since Unix epoch (1970-01-01)
+    let mut days: i64 = 0;
+
+    // Add days for complete years
+    for y in 1970..year {
+        let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+        days += if leap { 366 } else { 365 };
+    }
+
+    // Add days for complete months in current year
+    for m in 1..month {
+        days += DAYS_IN_MONTH[(m - 1) as usize] as i64;
+        if m == 2 && is_leap {
+            days += 1;
+        }
+    }
+
+    // Add days in current month
+    days += (day - 1) as i64;
+
+    // Convert to seconds
+    let timestamp = days * 86400 + (hour as i64) * 3600 + (min as i64) * 60 + (sec as i64);
+
+    if timestamp < 0 {
+        return None;
+    }
+
+    Some(timestamp as u64)
+}
+
+/// Check if a stored Last-Modified timestamp matches an If-Modified-Since header.
+///
+/// Per RFC 7232 Section 3.3, returns `true` (meaning "not modified") if:
+/// - The stored Last-Modified date is **equal to or earlier than** the
+///   If-Modified-Since date
+///
+/// Returns `false` if:
+/// - The stored Last-Modified date is later than If-Modified-Since
+/// - Either date cannot be parsed
+/// - Either value is empty
+///
+/// # Arguments
+/// * `stored_last_modified` - The Last-Modified header from the cached response
+/// * `if_modified_since` - The If-Modified-Since header from the client request
+pub fn matches_if_modified_since(stored_last_modified: &str, if_modified_since: &str) -> bool {
+    let stored_ts = match parse_http_date(stored_last_modified) {
+        Some(ts) => ts,
+        None => return false,
+    };
+
+    let client_ts = match parse_http_date(if_modified_since) {
+        Some(ts) => ts,
+        None => return false,
+    };
+
+    // If stored Last-Modified <= client If-Modified-Since, content is not modified
+    stored_ts <= client_ts
+}
+
+// =============================================================================
 // Cache Decision
 // =============================================================================
 
@@ -425,5 +665,198 @@ mod tests {
     fn matches_etag_empty_if_none_match_returns_false() {
         // Empty If-None-Match has no tags to match
         assert!(!matches_etag(r#""abc""#, ""));
+    }
+
+    // =========================================================================
+    // HTTP Date Parsing Tests (parse_http_date)
+    // =========================================================================
+
+    #[test]
+    fn parse_http_date_imf_fixdate() {
+        // Standard IMF-fixdate format (preferred)
+        let ts = parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        // 1994-11-06 08:49:37 UTC = 784111777
+        assert_eq!(ts, 784111777);
+    }
+
+    #[test]
+    fn parse_http_date_rfc850() {
+        // RFC 850 format (obsolete)
+        let ts = parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT").unwrap();
+        assert_eq!(ts, 784111777);
+    }
+
+    #[test]
+    fn parse_http_date_asctime() {
+        // asctime format (obsolete)
+        let ts = parse_http_date("Sun Nov  6 08:49:37 1994").unwrap();
+        assert_eq!(ts, 784111777);
+    }
+
+    #[test]
+    fn parse_http_date_epoch() {
+        // Unix epoch
+        let ts = parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT").unwrap();
+        assert_eq!(ts, 0);
+    }
+
+    #[test]
+    fn parse_http_date_y2k() {
+        // Y2K date
+        let ts = parse_http_date("Sat, 01 Jan 2000 00:00:00 GMT").unwrap();
+        // 2000-01-01 00:00:00 UTC = 946684800
+        assert_eq!(ts, 946684800);
+    }
+
+    #[test]
+    fn parse_http_date_leap_year_feb29() {
+        // February 29 in a leap year (2000)
+        let ts = parse_http_date("Tue, 29 Feb 2000 12:00:00 GMT").unwrap();
+        // 2000-02-29 12:00:00 UTC
+        assert_eq!(ts, 951825600);
+    }
+
+    #[test]
+    fn parse_http_date_non_leap_year_feb29_invalid() {
+        // February 29 in a non-leap year (1999) - should fail
+        assert!(parse_http_date("Mon, 29 Feb 1999 12:00:00 GMT").is_none());
+    }
+
+    #[test]
+    fn parse_http_date_rfc850_2digit_year_2000s() {
+        // RFC 850 with 2-digit year in 2000s
+        let ts = parse_http_date("Wednesday, 15-Mar-23 10:30:00 GMT").unwrap();
+        // 2023-03-15 10:30:00 UTC
+        assert_eq!(ts, 1678876200);
+    }
+
+    #[test]
+    fn parse_http_date_with_whitespace() {
+        // Leading/trailing whitespace
+        let ts = parse_http_date("  Sun, 06 Nov 1994 08:49:37 GMT  ").unwrap();
+        assert_eq!(ts, 784111777);
+    }
+
+    #[test]
+    fn parse_http_date_invalid_format() {
+        assert!(parse_http_date("").is_none());
+        assert!(parse_http_date("not a date").is_none());
+        assert!(parse_http_date("2024-01-01").is_none()); // ISO format not supported
+    }
+
+    #[test]
+    fn parse_http_date_invalid_month() {
+        assert!(parse_http_date("Sun, 06 Foo 1994 08:49:37 GMT").is_none());
+    }
+
+    #[test]
+    fn parse_http_date_invalid_day() {
+        // Day 32 is invalid
+        assert!(parse_http_date("Sun, 32 Nov 1994 08:49:37 GMT").is_none());
+    }
+
+    #[test]
+    fn parse_http_date_invalid_time() {
+        // Hour 25 is invalid
+        assert!(parse_http_date("Sun, 06 Nov 1994 25:49:37 GMT").is_none());
+    }
+
+    #[test]
+    fn parse_http_date_pre_epoch() {
+        // Date before Unix epoch
+        assert!(parse_http_date("Wed, 01 Jan 1969 00:00:00 GMT").is_none());
+    }
+
+    #[test]
+    fn parse_http_date_missing_gmt() {
+        // Missing GMT suffix for IMF-fixdate
+        assert!(parse_http_date("Sun, 06 Nov 1994 08:49:37").is_none());
+    }
+
+    // =========================================================================
+    // If-Modified-Since Matching Tests (matches_if_modified_since)
+    // =========================================================================
+
+    #[test]
+    fn matches_ims_exact_same_date() {
+        // Same date should match (not modified)
+        assert!(matches_if_modified_since(
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+            "Sun, 06 Nov 1994 08:49:37 GMT"
+        ));
+    }
+
+    #[test]
+    fn matches_ims_stored_earlier() {
+        // Stored is earlier than client's IMS - not modified
+        assert!(matches_if_modified_since(
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+            "Mon, 07 Nov 1994 08:49:37 GMT"
+        ));
+    }
+
+    #[test]
+    fn matches_ims_stored_later() {
+        // Stored is later than client's IMS - modified
+        assert!(!matches_if_modified_since(
+            "Mon, 07 Nov 1994 08:49:37 GMT",
+            "Sun, 06 Nov 1994 08:49:37 GMT"
+        ));
+    }
+
+    #[test]
+    fn matches_ims_different_formats() {
+        // IMF-fixdate stored, RFC 850 client (same actual time)
+        assert!(matches_if_modified_since(
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+            "Sunday, 06-Nov-94 08:49:37 GMT"
+        ));
+    }
+
+    #[test]
+    fn matches_ims_invalid_stored() {
+        // Invalid stored Last-Modified - returns false
+        assert!(!matches_if_modified_since(
+            "invalid date",
+            "Sun, 06 Nov 1994 08:49:37 GMT"
+        ));
+    }
+
+    #[test]
+    fn matches_ims_invalid_client() {
+        // Invalid client If-Modified-Since - returns false
+        assert!(!matches_if_modified_since(
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+            "invalid date"
+        ));
+    }
+
+    #[test]
+    fn matches_ims_empty_strings() {
+        assert!(!matches_if_modified_since("", ""));
+        assert!(!matches_if_modified_since("", "Sun, 06 Nov 1994 08:49:37 GMT"));
+        assert!(!matches_if_modified_since("Sun, 06 Nov 1994 08:49:37 GMT", ""));
+    }
+
+    #[test]
+    fn matches_ims_one_second_difference() {
+        // One second later should not match
+        assert!(!matches_if_modified_since(
+            "Sun, 06 Nov 1994 08:49:38 GMT",
+            "Sun, 06 Nov 1994 08:49:37 GMT"
+        ));
+
+        // One second earlier should match
+        assert!(matches_if_modified_since(
+            "Sun, 06 Nov 1994 08:49:36 GMT",
+            "Sun, 06 Nov 1994 08:49:37 GMT"
+        ));
+    }
+
+    #[test]
+    fn matches_ims_leap_second() {
+        // Leap second (sec=60) should be parsed
+        let ts = parse_http_date("Sat, 31 Dec 2016 23:59:60 GMT");
+        assert!(ts.is_some());
     }
 }
