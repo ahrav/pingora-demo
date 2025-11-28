@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod policy;
+pub mod proxy;
 pub mod storage;
 
 pub use cache::{
@@ -8,7 +9,8 @@ pub use cache::{
 };
 
 // Always export
-pub use policy::{parse_content_length, CachePolicy, NoOpPolicy};
+pub use policy::{CachePolicy, NoOpPolicy, parse_content_length};
+pub use proxy::{CacheControlDirectives, CacheDecision, parse_cache_control};
 
 // Only with multi-tier feature
 #[cfg(feature = "multi-tier")]
