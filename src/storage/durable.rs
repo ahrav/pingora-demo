@@ -149,6 +149,7 @@ fn deserialize_meta_inner(buf: &[u8]) -> Option<CacheMeta> {
         etag,
         last_modified,
         cache_control,
+        version: None,
     })
 }
 
@@ -201,6 +202,7 @@ struct BlobMiss<B: BlobStore, I: IndexStore> {
     object: ObjectId,
     meta: CacheMeta,
     writer: Box<dyn BlobWrite>,
+    expect_version: Option<u64>,
     phantom: PhantomData<B>,
 }
 
@@ -218,15 +220,36 @@ impl<B: BlobStore, I: IndexStore> MissHandler for BlobMiss<B, I> {
             etag: object_meta.etag,
             meta_blob: serialize_meta(&self.meta),
             expires_at: SystemTime::now() + self.meta.ttl,
-            version: 0,
+            version: self.expect_version.unwrap_or(0),
         };
-        match self
-            .index
-            .put_new(self.cache_key.as_slice(), &manifest)
-            .await
-        {
+
+        let result = match self.expect_version {
+            None => {
+                // Fresh fill - use put_new (first-writer-wins)
+                self.index
+                    .put_new(self.cache_key.as_slice(), &manifest)
+                    .await
+            }
+            Some(expected) => {
+                // Revalidation/update - use cas_update
+                self.index
+                    .cas_update(self.cache_key.as_slice(), expected, &manifest)
+                    .await
+            }
+        };
+
+        match result {
             Ok(_) => Ok(MissFinishType::Success),
-            Err(DurableError::PreconditionFailed) => Ok(MissFinishType::Success),
+            Err(DurableError::PreconditionFailed) => {
+                // Version mismatch - another write or PURGE happened
+                // Return success (best-effort caching)
+                Ok(MissFinishType::Success)
+            }
+            Err(DurableError::NotFound) => {
+                // Index entry was purged during in-flight fill
+                // Return success (best-effort caching)
+                Ok(MissFinishType::Success)
+            }
             Err(e) => Err(map_durable_err(e)),
         }
     }
@@ -252,6 +275,7 @@ impl<B: BlobStore + 'static, I: IndexStore + 'static> Storage for DurableTier<B,
         if meta.content_length.is_none() {
             meta.content_length = Some(obj_meta.len as usize);
         }
+        meta.version = Some(manifest.version);
 
         let hit: Box<dyn HitHandler> = Box::new(BlobHit { reader });
 
@@ -275,6 +299,7 @@ impl<B: BlobStore + 'static, I: IndexStore + 'static> Storage for DurableTier<B,
             object: id,
             meta: meta.clone(),
             writer,
+            expect_version: meta.version,
             phantom: PhantomData,
         }))
     }
@@ -285,17 +310,30 @@ impl<B: BlobStore + 'static, I: IndexStore + 'static> Storage for DurableTier<B,
             .get(key.as_slice())
             .await
             .map_err(map_durable_err)?;
-        if let Some(m) = manifest.clone() {
-            if matches!(typ, PurgeType::Hard) {
-                let _ = self.blob_store.delete(&m.object).await;
-            }
-            self.index_store
-                .delete(key.as_slice())
-                .await
-                .map_err(map_durable_err)?;
-            return Ok(true);
+
+        let Some(m) = manifest else {
+            return Ok(false); // Nothing to purge
+        };
+
+        // Step 1: Bump version via CAS to invalidate in-flight fills
+        let mut tombstone = m.clone();
+        tombstone.version += 1;
+        tombstone.expires_at = SystemTime::UNIX_EPOCH;
+        let _ = self
+            .index_store
+            .cas_update(key.as_slice(), m.version, &tombstone)
+            .await;
+
+        // Step 2: Now delete (in-flight fills will fail CAS)
+        if matches!(typ, PurgeType::Hard) {
+            let _ = self.blob_store.delete(&m.object).await;
         }
-        Ok(false)
+        self.index_store
+            .delete(key.as_slice())
+            .await
+            .map_err(map_durable_err)?;
+
+        Ok(true)
     }
 
     async fn update_meta(&self, key: &CacheKey, meta: &CacheMeta) -> CacheResult<bool> {
