@@ -35,6 +35,7 @@ pub struct CacheMeta {
     pub cache_control: Option<String>,
     pub created_at: Option<u64>,
     pub expires_at: Option<u64>,
+    pub version: Option<u64>,
 }
 
 impl CacheMeta {
@@ -55,6 +56,7 @@ impl CacheMeta {
             cache_control: None,
             created_at,
             expires_at,
+            version: None,
         }
     }
 
@@ -89,6 +91,7 @@ impl Default for CacheMeta {
             cache_control: None,
             created_at: None,
             expires_at: None,
+            version: None,
         }
     }
 }
@@ -116,8 +119,14 @@ pub type CacheResult<T> = Result<T, CacheError>;
 pub type StorageRef = Arc<dyn Storage>;
 
 pub enum LookupResult {
-    Fresh { meta: CacheMeta, hit: Box<dyn HitHandler> },
-    Stale { meta: CacheMeta, hit: Box<dyn HitHandler> },
+    Fresh {
+        meta: CacheMeta,
+        hit: Box<dyn HitHandler>,
+    },
+    Stale {
+        meta: CacheMeta,
+        hit: Box<dyn HitHandler>,
+    },
     Miss,
 }
 
