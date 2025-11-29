@@ -460,6 +460,67 @@ pub enum CacheDecision {
     FetchFromOrigin,
 }
 
+impl CacheDecision {
+    /// Determine the cache decision based on lookup result and client conditional headers.
+    ///
+    /// Implements RFC 7232 conditional request semantics with the constraint that
+    /// conditionals are only honored for **fresh** entries ("freshness before conditionals").
+    ///
+    /// # Decision Logic
+    ///
+    /// | Lookup State | Conditionals | Decision |
+    /// |--------------|--------------|----------|
+    /// | Fresh | If-None-Match matches | NotModified |
+    /// | Fresh | If-Modified-Since matches (no INM) | NotModified |
+    /// | Fresh | No match / no conditionals | ServeFromCache |
+    /// | Stale | Any | RevalidateWithOrigin |
+    /// | Miss | Any | FetchFromOrigin |
+    ///
+    /// Per RFC 7232 Section 6, If-None-Match takes precedence over If-Modified-Since.
+    ///
+    /// # Arguments
+    /// * `lookup` - The result of the cache lookup
+    /// * `if_none_match` - The If-None-Match header value from the client request
+    /// * `if_modified_since` - The If-Modified-Since header value from the client request
+    pub fn from_lookup(
+        lookup: LookupResult,
+        if_none_match: Option<&str>,
+        if_modified_since: Option<&str>,
+    ) -> Self {
+        match lookup {
+            LookupResult::Fresh { meta, hit } => {
+                // Check If-None-Match first (has precedence per RFC 7232 Section 6)
+                let etag_matches = if_none_match
+                    .zip(meta.etag.as_ref())
+                    .is_some_and(|(inm, stored)| matches_etag(stored, inm));
+
+                if etag_matches {
+                    return CacheDecision::NotModified { meta };
+                }
+
+                // Check If-Modified-Since (only if no If-None-Match matched)
+                let ims_matches = if_modified_since
+                    .zip(meta.last_modified.as_ref())
+                    .is_some_and(|(ims, stored)| matches_if_modified_since(stored, ims));
+
+                if ims_matches {
+                    return CacheDecision::NotModified { meta };
+                }
+
+                // No conditional match - serve from cache
+                CacheDecision::ServeFromCache { meta, hit }
+            }
+
+            LookupResult::Stale { meta, hit: _ } => {
+                // Stale entries always trigger revalidation (hit handler dropped)
+                CacheDecision::RevalidateWithOrigin { stale: Some(meta) }
+            }
+
+            LookupResult::Miss => CacheDecision::FetchFromOrigin,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -858,5 +919,254 @@ mod tests {
         // Leap second (sec=60) should be parsed
         let ts = parse_http_date("Sat, 31 Dec 2016 23:59:60 GMT");
         assert!(ts.is_some());
+    }
+
+    // =========================================================================
+    // CacheDecision::from_lookup() Tests
+    // =========================================================================
+
+    use crate::cache::CacheResult;
+    use async_trait::async_trait;
+    use std::time::Duration;
+
+    /// Mock HitHandler for testing
+    struct MockHitHandler;
+
+    #[async_trait]
+    impl HitHandler for MockHitHandler {
+        async fn read_body(&mut self) -> CacheResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn finish(self: Box<Self>) -> CacheResult<()> {
+            Ok(())
+        }
+    }
+
+    fn fresh_lookup(meta: CacheMeta) -> LookupResult {
+        LookupResult::Fresh {
+            meta,
+            hit: Box::new(MockHitHandler),
+        }
+    }
+
+    fn stale_lookup(meta: CacheMeta) -> LookupResult {
+        LookupResult::Stale {
+            meta,
+            hit: Box::new(MockHitHandler),
+        }
+    }
+
+    fn test_meta() -> CacheMeta {
+        CacheMeta {
+            content_length: Some(100),
+            ttl: Duration::from_secs(3600),
+            content_type: Some("text/plain".to_string()),
+            etag: Some(r#""abc123""#.to_string()),
+            last_modified: Some("Sun, 06 Nov 1994 08:49:37 GMT".to_string()),
+            cache_control: None,
+            created_at: None,
+            expires_at: None,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn from_lookup_fresh_with_matching_etag() {
+        let lookup = fresh_lookup(test_meta());
+        let decision = CacheDecision::from_lookup(lookup, Some(r#""abc123""#), None);
+        match decision {
+            CacheDecision::NotModified { meta } => {
+                assert_eq!(meta.etag, Some(r#""abc123""#.to_string()));
+            }
+            _ => panic!("Expected NotModified"),
+        }
+    }
+
+    #[test]
+    fn from_lookup_fresh_with_matching_ims() {
+        let lookup = fresh_lookup(test_meta());
+        // Same date as stored Last-Modified
+        let decision =
+            CacheDecision::from_lookup(lookup, None, Some("Sun, 06 Nov 1994 08:49:37 GMT"));
+        match decision {
+            CacheDecision::NotModified { meta } => {
+                assert_eq!(
+                    meta.last_modified,
+                    Some("Sun, 06 Nov 1994 08:49:37 GMT".to_string())
+                );
+            }
+            _ => panic!("Expected NotModified"),
+        }
+    }
+
+    #[test]
+    fn from_lookup_fresh_etag_takes_precedence() {
+        // When both If-None-Match and If-Modified-Since are present,
+        // If-None-Match takes precedence per RFC 7232 Section 6
+        let lookup = fresh_lookup(test_meta());
+        let decision = CacheDecision::from_lookup(
+            lookup,
+            Some(r#""abc123""#),               // Matching ETag
+            Some("Sun, 06 Nov 1980 00:00:00 GMT"), // Would not match (stored is later)
+        );
+        match decision {
+            CacheDecision::NotModified { .. } => {}
+            _ => panic!("Expected NotModified (ETag match should take precedence)"),
+        }
+    }
+
+    #[test]
+    fn from_lookup_fresh_no_conditional_match() {
+        let lookup = fresh_lookup(test_meta());
+        // Non-matching ETag
+        let decision = CacheDecision::from_lookup(lookup, Some(r#""xyz789""#), None);
+        match decision {
+            CacheDecision::ServeFromCache { meta, .. } => {
+                assert_eq!(meta.etag, Some(r#""abc123""#.to_string()));
+            }
+            _ => panic!("Expected ServeFromCache"),
+        }
+    }
+
+    #[test]
+    fn from_lookup_fresh_no_conditionals() {
+        let lookup = fresh_lookup(test_meta());
+        let decision = CacheDecision::from_lookup(lookup, None, None);
+        match decision {
+            CacheDecision::ServeFromCache { meta, .. } => {
+                assert_eq!(meta.content_length, Some(100));
+            }
+            _ => panic!("Expected ServeFromCache"),
+        }
+    }
+
+    #[test]
+    fn from_lookup_fresh_missing_stored_etag() {
+        let mut meta = test_meta();
+        meta.etag = None;
+        let lookup = fresh_lookup(meta);
+        // If-None-Match provided but no stored ETag - should serve from cache
+        let decision = CacheDecision::from_lookup(lookup, Some(r#""abc123""#), None);
+        match decision {
+            CacheDecision::ServeFromCache { .. } => {}
+            _ => panic!("Expected ServeFromCache when stored ETag is missing"),
+        }
+    }
+
+    #[test]
+    fn from_lookup_fresh_missing_stored_last_modified() {
+        let mut meta = test_meta();
+        meta.last_modified = None;
+        let lookup = fresh_lookup(meta);
+        // If-Modified-Since provided but no stored Last-Modified - should serve from cache
+        let decision =
+            CacheDecision::from_lookup(lookup, None, Some("Sun, 06 Nov 1994 08:49:37 GMT"));
+        match decision {
+            CacheDecision::ServeFromCache { .. } => {}
+            _ => panic!("Expected ServeFromCache when stored Last-Modified is missing"),
+        }
+    }
+
+    #[test]
+    fn from_lookup_stale_ignores_conditionals() {
+        let lookup = stale_lookup(test_meta());
+        // Even with matching conditional headers, stale entries should revalidate
+        let decision = CacheDecision::from_lookup(
+            lookup,
+            Some(r#""abc123""#),                   // Would match if fresh
+            Some("Sun, 06 Nov 1994 08:49:37 GMT"), // Would match if fresh
+        );
+        match decision {
+            CacheDecision::RevalidateWithOrigin { stale } => {
+                assert!(stale.is_some());
+                assert_eq!(stale.unwrap().etag, Some(r#""abc123""#.to_string()));
+            }
+            _ => panic!("Expected RevalidateWithOrigin"),
+        }
+    }
+
+    #[test]
+    fn from_lookup_stale_no_conditionals() {
+        let lookup = stale_lookup(test_meta());
+        let decision = CacheDecision::from_lookup(lookup, None, None);
+        match decision {
+            CacheDecision::RevalidateWithOrigin { stale } => {
+                assert!(stale.is_some());
+            }
+            _ => panic!("Expected RevalidateWithOrigin"),
+        }
+    }
+
+    #[test]
+    fn from_lookup_miss() {
+        let decision = CacheDecision::from_lookup(LookupResult::Miss, None, None);
+        match decision {
+            CacheDecision::FetchFromOrigin => {}
+            _ => panic!("Expected FetchFromOrigin"),
+        }
+    }
+
+    #[test]
+    fn from_lookup_miss_ignores_conditionals() {
+        // Miss should return FetchFromOrigin regardless of client conditionals
+        let decision = CacheDecision::from_lookup(
+            LookupResult::Miss,
+            Some(r#""abc123""#),
+            Some("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        match decision {
+            CacheDecision::FetchFromOrigin => {}
+            _ => panic!("Expected FetchFromOrigin"),
+        }
+    }
+
+    #[test]
+    fn from_lookup_fresh_wildcard_if_none_match() {
+        let lookup = fresh_lookup(test_meta());
+        let decision = CacheDecision::from_lookup(lookup, Some("*"), None);
+        match decision {
+            CacheDecision::NotModified { .. } => {}
+            _ => panic!("Expected NotModified for wildcard If-None-Match"),
+        }
+    }
+
+    #[test]
+    fn from_lookup_fresh_multiple_etags_one_matches() {
+        let lookup = fresh_lookup(test_meta());
+        // If-None-Match with multiple ETags, one matches stored
+        let decision =
+            CacheDecision::from_lookup(lookup, Some(r#""foo", "abc123", "bar""#), None);
+        match decision {
+            CacheDecision::NotModified { .. } => {}
+            _ => panic!("Expected NotModified when one ETag matches"),
+        }
+    }
+
+    #[test]
+    fn from_lookup_fresh_ims_earlier_than_stored() {
+        let lookup = fresh_lookup(test_meta());
+        // Client's IMS is before stored Last-Modified - should serve from cache
+        let decision = CacheDecision::from_lookup(
+            lookup,
+            None,
+            Some("Sun, 05 Nov 1994 08:49:37 GMT"), // Earlier than stored
+        );
+        match decision {
+            CacheDecision::ServeFromCache { .. } => {}
+            _ => panic!("Expected ServeFromCache when IMS is earlier"),
+        }
+    }
+
+    #[test]
+    fn from_lookup_fresh_weak_strong_etag_mix() {
+        // Weak ETag stored, client sends strong - should match via weak comparison
+        let mut meta = test_meta();
+        meta.etag = Some(r#"W/"abc123""#.to_string());
+        let lookup = fresh_lookup(meta);
+        let decision = CacheDecision::from_lookup(lookup, Some(r#""abc123""#), None);
+        match decision {
+            CacheDecision::NotModified { .. } => {}
+            _ => panic!("Expected NotModified via weak comparison"),
+        }
     }
 }
