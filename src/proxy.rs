@@ -3,7 +3,7 @@
 //! This module provides the bridge between HTTP proxy request handling
 //! and the underlying cache storage layer.
 
-use crate::cache::{CacheMeta, HitHandler};
+use crate::cache::{CacheMeta, HitHandler, LookupResult};
 
 /// Parsed Cache-Control directives.
 #[derive(Debug, Default, PartialEq, Eq)]
