@@ -3,7 +3,246 @@
 //! This module provides the bridge between HTTP proxy request handling
 //! and the underlying cache storage layer.
 
-use crate::cache::{CacheMeta, HitHandler, LookupResult};
+use crate::cache::{CacheKey, CacheMeta, HitHandler, LookupResult, StorageRef};
+
+use async_trait::async_trait;
+use pingora_core::upstreams::peer::HttpPeer;
+use pingora_error::{Error, ErrorType, Result as PingoraResult};
+use pingora_http::ResponseHeader;
+use pingora_proxy::{ProxyHttp, Session};
+
+// =============================================================================
+// Proxy Configuration
+// =============================================================================
+
+/// Configuration for the image cache proxy.
+#[derive(Clone, Debug, Default)]
+pub struct CacheProxyConfig {
+    /// When true, client Cache-Control: no-cache forces revalidation.
+    /// Default false (trusted downstreams per MVP architecture doc).
+    pub strict_client_no_cache: bool,
+}
+
+// =============================================================================
+// Per-Request Context
+// =============================================================================
+
+/// Per-request context passed between ProxyHttp filter methods.
+#[derive(Default)]
+pub struct RequestCtx {
+    /// Cache key derived from request URI.
+    pub cache_key: Option<CacheKey>,
+
+    /// Stale metadata for revalidation (used by upstream_request_filter).
+    pub stale_meta: Option<CacheMeta>,
+
+    /// Whether serving from cache (vs origin).
+    pub serve_from_cache: bool,
+
+    /// Response meta for cache hits (used by upstream filters if needed).
+    pub cached_meta: Option<CacheMeta>,
+}
+
+// =============================================================================
+// Image Cache Proxy
+// =============================================================================
+
+/// HTTP cache proxy implementing Pingora's ProxyHttp trait.
+pub struct ImageCacheProxy {
+    storage: StorageRef,
+    config: CacheProxyConfig,
+    /// Upstream origin server.
+    upstream: HttpPeer,
+}
+
+impl ImageCacheProxy {
+    /// Create a new ImageCacheProxy with the given storage, upstream, and config.
+    pub fn new(storage: StorageRef, upstream: HttpPeer, config: CacheProxyConfig) -> Self {
+        Self {
+            storage,
+            config,
+            upstream,
+        }
+    }
+
+    /// Create a new ImageCacheProxy with default configuration.
+    pub fn with_defaults(storage: StorageRef, upstream: HttpPeer) -> Self {
+        Self::new(storage, upstream, CacheProxyConfig::default())
+    }
+
+    /// Set standard cache response headers from CacheMeta.
+    ///
+    /// Validates header values to prevent header injection attacks (CR/LF).
+    fn set_cache_headers(resp: &mut ResponseHeader, meta: &CacheMeta) -> PingoraResult<()> {
+        // Helper to validate header values don't contain CR/LF (header injection prevention)
+        fn is_valid_header_value(value: &str) -> bool {
+            !value.contains('\r') && !value.contains('\n')
+        }
+
+        if let Some(ref ct) = meta.content_type
+            && is_valid_header_value(ct)
+        {
+            resp.insert_header("content-type", ct)?;
+        }
+        if let Some(len) = meta.content_length {
+            resp.insert_header("content-length", len.to_string())?;
+        }
+        if let Some(ref etag) = meta.etag
+            && is_valid_header_value(etag)
+        {
+            resp.insert_header("etag", etag)?;
+        }
+        if let Some(ref lm) = meta.last_modified
+            && is_valid_header_value(lm)
+        {
+            resp.insert_header("last-modified", lm)?;
+        }
+        if let Some(ref cc) = meta.cache_control
+            && is_valid_header_value(cc)
+        {
+            resp.insert_header("cache-control", cc)?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ProxyHttp for ImageCacheProxy {
+    type CTX = RequestCtx;
+
+    fn new_ctx(&self) -> Self::CTX {
+        RequestCtx::default()
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> PingoraResult<Box<HttpPeer>> {
+        Ok(Box::new(self.upstream.clone()))
+    }
+
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> PingoraResult<bool> {
+        // 1. Extract URI path and build cache key
+        let path = session.req_header().uri.path();
+        let cache_key = CacheKey::from(path);
+
+        // 2. Check client Cache-Control: no-cache (if strict mode)
+        let client_no_cache = if self.config.strict_client_no_cache {
+            session
+                .req_header()
+                .headers
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok())
+                .map(parse_cache_control)
+                .is_some_and(|cc| cc.no_cache)
+        } else {
+            false
+        };
+
+        // 3. Perform cache lookup
+        let lookup_result = self.storage.lookup(&cache_key).await.map_err(|e| {
+            Error::because(ErrorType::InternalError, "cache lookup failed", e)
+        })?;
+
+        // Store cache key in context (after lookup to avoid clone)
+        ctx.cache_key = Some(cache_key);
+
+        // 4. Handle client no-cache in strict mode
+        if client_no_cache {
+            match lookup_result {
+                LookupResult::Fresh { meta, hit } | LookupResult::Stale { meta, hit } => {
+                    // Clean up hit handler before proceeding to origin (best-effort)
+                    let _ = hit.finish().await;
+                    ctx.stale_meta = Some(meta);
+                    return Ok(false); // Continue to origin
+                }
+                LookupResult::Miss => return Ok(false),
+            }
+        }
+
+        // 5. Extract client conditional headers
+        let if_none_match = session
+            .req_header()
+            .headers
+            .get("if-none-match")
+            .and_then(|v| v.to_str().ok());
+        let if_modified_since = session
+            .req_header()
+            .headers
+            .get("if-modified-since")
+            .and_then(|v| v.to_str().ok());
+
+        // 6. Determine cache decision
+        let decision = CacheDecision::from_lookup(lookup_result, if_none_match, if_modified_since);
+
+        // 7. Handle decision
+        match decision {
+            CacheDecision::ServeFromCache { meta, mut hit } => {
+                ctx.serve_from_cache = true;
+                ctx.cached_meta = Some(meta.clone());
+
+                // Build 200 response headers
+                let mut resp = ResponseHeader::build(200, Some(8))?;
+                Self::set_cache_headers(&mut resp, &meta)?;
+                resp.insert_header("x-cache", "HIT")?;
+
+                // Write headers (not end of stream - body follows)
+                session
+                    .write_response_header(Box::new(resp), false)
+                    .await?;
+
+                // Stream body from HitHandler
+                while let Some(chunk) = hit.read_body().await.map_err(|e| {
+                    Error::because(ErrorType::ReadError, "cache read failed", e)
+                })? {
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(chunk)), false)
+                        .await?;
+                }
+
+                // Signal end of body
+                session.write_response_body(None, true).await?;
+                // Best-effort cleanup of hit handler
+                let _ = hit.finish().await;
+
+                Ok(true) // Response complete, don't go to upstream
+            }
+
+            CacheDecision::NotModified { meta } => {
+                // Build 304 response (no body)
+                let mut resp = ResponseHeader::build(304, Some(4))?;
+                if let Some(ref etag) = meta.etag {
+                    resp.insert_header("etag", etag)?;
+                }
+                if let Some(ref lm) = meta.last_modified {
+                    resp.insert_header("last-modified", lm)?;
+                }
+                if let Some(ref cc) = meta.cache_control {
+                    resp.insert_header("cache-control", cc)?;
+                }
+
+                // Write headers with end_of_stream=true (304 has no body)
+                session.write_response_header(Box::new(resp), true).await?;
+
+                Ok(true) // Response complete
+            }
+
+            CacheDecision::RevalidateWithOrigin { stale } => {
+                ctx.stale_meta = stale;
+                Ok(false) // Continue to upstream for revalidation
+            }
+
+            CacheDecision::FetchFromOrigin => {
+                Ok(false) // Continue to upstream
+            }
+        }
+    }
+}
 
 /// Parsed Cache-Control directives.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -32,10 +271,20 @@ impl CacheControlDirectives {
 }
 
 /// Parse a Cache-Control header into structured directives.
+///
+/// Input length is capped at 256 bytes and directive count at 10 to prevent DoS.
 pub fn parse_cache_control(value: &str) -> CacheControlDirectives {
+    const MAX_CC_LENGTH: usize = 256;
+    const MAX_CC_DIRECTIVES: usize = 10;
+
     let mut directives = CacheControlDirectives::default();
 
-    for part in value.split(',') {
+    // Cap input length to prevent DoS
+    if value.len() > MAX_CC_LENGTH {
+        return directives;
+    }
+
+    for part in value.split(',').take(MAX_CC_DIRECTIVES) {
         let token = part.trim();
         if token.is_empty() {
             continue;
@@ -144,7 +393,10 @@ pub fn parse_etag(s: &str) -> Option<ETag> {
 /// - Multiple ETags: `"foo", "bar", W/"baz"`
 ///
 /// Invalid entries are skipped (defensive parsing).
+/// Number of ETags is capped at 20 to prevent DoS.
 pub fn parse_if_none_match(header: &str) -> IfNoneMatch {
+    const MAX_ETAGS: usize = 20;
+
     let header = header.trim();
 
     // Check for wildcard
@@ -152,8 +404,12 @@ pub fn parse_if_none_match(header: &str) -> IfNoneMatch {
         return IfNoneMatch::Any;
     }
 
-    // Parse comma-separated ETags
-    let tags: Vec<ETag> = header.split(',').filter_map(parse_etag).collect();
+    // Parse comma-separated ETags (limited to prevent DoS)
+    let tags: Vec<ETag> = header
+        .split(',')
+        .take(MAX_ETAGS)
+        .filter_map(parse_etag)
+        .collect();
 
     IfNoneMatch::Tags(tags)
 }
@@ -200,7 +456,14 @@ pub fn matches_etag(stored_etag: &str, if_none_match: &str) -> bool {
 /// - asctime: `Sun Nov  6 08:49:37 1994` (obsolete)
 ///
 /// Returns `None` if the date cannot be parsed.
+/// Input length is capped at 64 bytes to prevent DoS.
 pub fn parse_http_date(s: &str) -> Option<u64> {
+    // Cap input length to prevent DoS via excessive whitespace
+    const MAX_HTTP_DATE_LEN: usize = 64;
+    if s.len() > MAX_HTTP_DATE_LEN {
+        return None;
+    }
+
     let s = s.trim();
 
     // Try IMF-fixdate first (most common): "Sun, 06 Nov 1994 08:49:37 GMT"
@@ -341,6 +604,7 @@ fn month_from_str(s: &str) -> Option<u32> {
 /// Convert date/time components to Unix timestamp.
 ///
 /// Uses a simplified algorithm that handles dates from 1970 onwards.
+/// Year is capped at 2100 to prevent DoS via excessive loop iterations.
 fn timestamp_from_components(
     year: i32,
     month: u32,
@@ -349,8 +613,13 @@ fn timestamp_from_components(
     min: u32,
     sec: u32,
 ) -> Option<u64> {
-    // Validate basic ranges
-    if year < 1970 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    // Validate basic ranges (year capped at 2100 to prevent DoS)
+    const MIN_YEAR: i32 = 1970;
+    const MAX_YEAR: i32 = 2100;
+    if !(MIN_YEAR..=MAX_YEAR).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+    {
         return None;
     }
 
