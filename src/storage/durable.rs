@@ -6,8 +6,6 @@ use crate::storage::traits::{
     BlobRead, BlobStore, BlobWrite, DurableError, IndexStore, Manifest, ObjectId,
 };
 use async_trait::async_trait;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -153,17 +151,26 @@ fn deserialize_meta_inner(buf: &[u8]) -> Option<CacheMeta> {
     })
 }
 
-// TODO: What is the underlying hasher?
-// Do we need to contruct a new hasher for every call,
-// is there a perf penatly for consturcitng the hasher,
-// can the hasher be reused?
+/// Generate an ObjectId for blob storage from a CacheKey.
+///
+/// Since CacheKey is now pre-hashed with format "idx-{hash:x}", we transform
+/// it to "obj-{hash:x}" for blob storage to maintain distinct namespaces
+/// while avoiding redundant hashing.
 fn object_id_for(key: &CacheKey) -> ObjectId {
-    let mut hasher = DefaultHasher::new();
-    key.hash(&mut hasher);
-    let hashed = hasher.finish();
+    // CacheKey is already hashed with format "idx-{hash:x}"
+    // Transform to "obj-{hash:x}" for blob storage
+    let key_str = std::str::from_utf8(key.as_slice())
+        .expect("CacheKey hashed bytes should always be valid UTF-8");
+
+    // Use strip_prefix instead of replace to only transform the prefix,
+    // not any occurrences of "idx-" that might appear in the hash itself
+    let hash_part = key_str
+        .strip_prefix("idx-")
+        .expect("CacheKey should always start with 'idx-' prefix");
+
     ObjectId {
         bucket: None,
-        key: format!("obj-{hashed:x}"),
+        key: format!("obj-{hash_part}"),
     }
 }
 
