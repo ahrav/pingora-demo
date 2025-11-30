@@ -144,15 +144,26 @@ impl ProxyHttp for ImageCacheProxy {
             false
         };
 
-        // 3. Perform cache lookup
-        let lookup_result = self.storage.lookup(&cache_key).await.map_err(|e| {
-            Error::because(ErrorType::InternalError, "cache lookup failed", e)
-        })?;
+        // 3. Only cache safe methods (GET/HEAD) per RFC 7231 Section 4.2.1
+        // Unsafe methods (POST/PUT/DELETE/PATCH) must always go to origin.
+        // Note: session.req_header().method is http::Method enum, guarantees canonical uppercase.
+        let method = session.req_header().method.as_str();
+        let is_head = method == "HEAD";
+        if method != "GET" && method != "HEAD" {
+            return Ok(false); // Unsafe method, skip cache and go to origin
+        }
+
+        // 4. Perform cache lookup
+        let lookup_result = self
+            .storage
+            .lookup(&cache_key)
+            .await
+            .map_err(|e| Error::because(ErrorType::InternalError, "cache lookup failed", e))?;
 
         // Store cache key in context (after lookup to avoid clone)
         ctx.cache_key = Some(cache_key);
 
-        // 4. Handle client no-cache in strict mode
+        // 5. Handle client no-cache in strict mode
         if client_no_cache {
             match lookup_result {
                 LookupResult::Fresh { meta, hit } | LookupResult::Stale { meta, hit } => {
@@ -165,7 +176,7 @@ impl ProxyHttp for ImageCacheProxy {
             }
         }
 
-        // 5. Extract client conditional headers
+        // 6. Extract client conditional headers
         let if_none_match = session
             .req_header()
             .headers
@@ -177,10 +188,10 @@ impl ProxyHttp for ImageCacheProxy {
             .get("if-modified-since")
             .and_then(|v| v.to_str().ok());
 
-        // 6. Determine cache decision
+        // 7. Determine cache decision
         let decision = CacheDecision::from_lookup(lookup_result, if_none_match, if_modified_since);
 
-        // 7. Handle decision
+        // 8. Handle decision (with HEAD body suppression)
         match decision {
             CacheDecision::ServeFromCache { meta, mut hit } => {
                 ctx.serve_from_cache = true;
@@ -191,22 +202,28 @@ impl ProxyHttp for ImageCacheProxy {
                 Self::set_cache_headers(&mut resp, &meta)?;
                 resp.insert_header("x-cache", "HIT")?;
 
-                // Write headers (not end of stream - body follows)
-                session
-                    .write_response_header(Box::new(resp), false)
-                    .await?;
+                if is_head {
+                    // HEAD: write headers with end_of_stream=true (no body)
+                    session.write_response_header(Box::new(resp), true).await?;
+                } else {
+                    // GET: write headers, then stream body
+                    session.write_response_header(Box::new(resp), false).await?;
 
-                // Stream body from HitHandler
-                while let Some(chunk) = hit.read_body().await.map_err(|e| {
-                    Error::because(ErrorType::ReadError, "cache read failed", e)
-                })? {
-                    session
-                        .write_response_body(Some(bytes::Bytes::from(chunk)), false)
-                        .await?;
+                    // Stream body from HitHandler
+                    while let Some(chunk) = hit
+                        .read_body()
+                        .await
+                        .map_err(|e| Error::because(ErrorType::ReadError, "cache read failed", e))?
+                    {
+                        session
+                            .write_response_body(Some(bytes::Bytes::from(chunk)), false)
+                            .await?;
+                    }
+
+                    // Signal end of body
+                    session.write_response_body(None, true).await?;
                 }
 
-                // Signal end of body
-                session.write_response_body(None, true).await?;
                 // Best-effort cleanup of hit handler
                 let _ = hit.finish().await;
 
@@ -1164,8 +1181,14 @@ mod tests {
     #[test]
     fn matches_ims_empty_strings() {
         assert!(!matches_if_modified_since("", ""));
-        assert!(!matches_if_modified_since("", "Sun, 06 Nov 1994 08:49:37 GMT"));
-        assert!(!matches_if_modified_since("Sun, 06 Nov 1994 08:49:37 GMT", ""));
+        assert!(!matches_if_modified_since(
+            "",
+            "Sun, 06 Nov 1994 08:49:37 GMT"
+        ));
+        assert!(!matches_if_modified_since(
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+            ""
+        ));
     }
 
     #[test]
@@ -1275,7 +1298,7 @@ mod tests {
         let lookup = fresh_lookup(test_meta());
         let decision = CacheDecision::from_lookup(
             lookup,
-            Some(r#""abc123""#),               // Matching ETag
+            Some(r#""abc123""#),                   // Matching ETag
             Some("Sun, 06 Nov 1980 00:00:00 GMT"), // Would not match (stored is later)
         );
         match decision {
@@ -1403,8 +1426,7 @@ mod tests {
     fn from_lookup_fresh_multiple_etags_one_matches() {
         let lookup = fresh_lookup(test_meta());
         // If-None-Match with multiple ETags, one matches stored
-        let decision =
-            CacheDecision::from_lookup(lookup, Some(r#""foo", "abc123", "bar""#), None);
+        let decision = CacheDecision::from_lookup(lookup, Some(r#""foo", "abc123", "bar""#), None);
         match decision {
             CacheDecision::NotModified { .. } => {}
             _ => panic!("Expected NotModified when one ETag matches"),
