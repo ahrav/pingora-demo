@@ -10,7 +10,10 @@ pub use cache::{
 
 // Always export
 pub use policy::{CachePolicy, NoOpPolicy, parse_content_length};
-pub use proxy::{CacheControlDirectives, CacheDecision, parse_cache_control};
+pub use proxy::{
+    CacheControlDirectives, CacheDecision, CacheProxyConfig, ImageCacheProxy, RequestCtx,
+    parse_cache_control,
+};
 
 // Only with multi-tier feature
 #[cfg(feature = "multi-tier")]

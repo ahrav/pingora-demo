@@ -11,3 +11,11 @@ multi-tier = []
 async-trait = "0.1"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt", "sync"] }
+
+# Pingora proxy framework
+pingora-proxy = "0.6"
+pingora-core = "0.6"
+pingora-http = "0.6"
+pingora-error = "0.6"
+bytes = "1"
+http = "1"
