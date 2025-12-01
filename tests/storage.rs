@@ -1,3 +1,6 @@
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::default_constructed_unit_structs)]
+
 use pingora_demo::cache::{
     CacheError, CacheKey, CacheMeta, CacheResult, HitHandler, LookupResult, MissFinishType,
     MissHandler, PurgeType, Storage,

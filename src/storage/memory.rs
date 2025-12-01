@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)]
+
 use crate::cache::{
     CacheError, CacheKey, CacheMeta, CacheResult, HitHandler, LookupResult, MissFinishType,
     MissHandler, PurgeType, Storage,

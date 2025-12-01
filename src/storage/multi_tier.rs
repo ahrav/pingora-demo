@@ -1,5 +1,7 @@
 //! Multi-tier cache orchestrator with promotion logic.
 
+#![allow(clippy::collapsible_if)]
+
 use crate::cache::{
     CacheKey, CacheMeta, CacheResult, HitHandler, LookupResult, MissFinishType, MissHandler,
     PurgeType, Storage,
