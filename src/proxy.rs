@@ -41,6 +41,10 @@ pub struct RequestCtx {
 
     /// Response meta for cache hits (used by upstream filters if needed).
     pub cached_meta: Option<CacheMeta>,
+
+    /// Stale HitHandler for stale-if-error support.
+    /// When origin fails (5xx/timeout), this handler can stream the stale body.
+    pub stale_hit: Option<Box<dyn HitHandler>>,
 }
 
 // =============================================================================
@@ -167,9 +171,10 @@ impl ProxyHttp for ImageCacheProxy {
         if client_no_cache {
             match lookup_result {
                 LookupResult::Fresh { meta, hit } | LookupResult::Stale { meta, hit } => {
-                    // Clean up hit handler before proceeding to origin (best-effort)
-                    let _ = hit.finish().await;
+                    // Preserve hit for stale-if-error even in client no-cache path
+                    // TODO: Finish stale hits when strict client no-cache bypasses cache to avoid leaking HitHandler resources.
                     ctx.stale_meta = Some(meta);
+                    ctx.stale_hit = Some(hit);
                     return Ok(false); // Continue to origin
                 }
                 LookupResult::Miss => return Ok(false),
@@ -188,8 +193,9 @@ impl ProxyHttp for ImageCacheProxy {
             .get("if-modified-since")
             .and_then(|v| v.to_str().ok());
 
-        // 7. Determine cache decision
-        let decision = CacheDecision::from_lookup(lookup_result, if_none_match, if_modified_since);
+        // 7. Determine cache decision (returns hit separately for cleanup/stale-if-error)
+        let (decision, returned_hit) =
+            CacheDecision::from_lookup(lookup_result, if_none_match, if_modified_since);
 
         // 8. Handle decision (with HEAD body suppression)
         match decision {
@@ -231,6 +237,11 @@ impl ProxyHttp for ImageCacheProxy {
             }
 
             CacheDecision::NotModified { meta } => {
+                // Best-effort cleanup of unused hit handler
+                if let Some(hit) = returned_hit {
+                    let _ = hit.finish().await;
+                }
+
                 // Build 304 response (no body)
                 let mut resp = ResponseHeader::build(304, Some(4))?;
                 if let Some(ref etag) = meta.etag {
@@ -250,6 +261,8 @@ impl ProxyHttp for ImageCacheProxy {
             }
 
             CacheDecision::RevalidateWithOrigin { stale } => {
+                // Store stale hit for potential stale-if-error usage in response_filter
+                ctx.stale_hit = returned_hit;
                 ctx.stale_meta = stale;
                 Ok(false) // Continue to upstream for revalidation
             }
@@ -754,15 +767,22 @@ impl CacheDecision {
     ///
     /// # Decision Logic
     ///
-    /// | Lookup State | Conditionals | Decision |
-    /// |--------------|--------------|----------|
-    /// | Fresh | If-None-Match matches | NotModified |
-    /// | Fresh | If-Modified-Since matches (no INM) | NotModified |
-    /// | Fresh | No match / no conditionals | ServeFromCache |
-    /// | Stale | Any | RevalidateWithOrigin |
-    /// | Miss | Any | FetchFromOrigin |
+    /// | Lookup State | Conditionals | Decision | Returned Hit |
+    /// |--------------|--------------|----------|--------------|
+    /// | Fresh | If-None-Match matches | NotModified | Some (for cleanup) |
+    /// | Fresh | If-Modified-Since matches (no INM) | NotModified | Some (for cleanup) |
+    /// | Fresh | No match / no conditionals | ServeFromCache | None (consumed) |
+    /// | Stale | Any | RevalidateWithOrigin | Some (for stale-if-error) |
+    /// | Miss | Any | FetchFromOrigin | None |
     ///
     /// Per RFC 7232 Section 6, If-None-Match takes precedence over If-Modified-Since.
+    ///
+    /// # Returns
+    /// A tuple of (CacheDecision, Option<HitHandler>):
+    /// - For Stale lookups: hit is returned for stale-if-error support
+    /// - For Fresh+NotModified: hit is returned for cleanup
+    /// - For Fresh+ServeFromCache: hit is consumed by decision (None returned)
+    /// - For Miss: None returned
     ///
     /// # Arguments
     /// * `lookup` - The result of the cache lookup
@@ -772,7 +792,7 @@ impl CacheDecision {
         lookup: LookupResult,
         if_none_match: Option<&str>,
         if_modified_since: Option<&str>,
-    ) -> Self {
+    ) -> (Self, Option<Box<dyn HitHandler>>) {
         match lookup {
             LookupResult::Fresh { meta, hit } => {
                 // Check If-None-Match first (has precedence per RFC 7232 Section 6)
@@ -781,7 +801,8 @@ impl CacheDecision {
                     .is_some_and(|(inm, stored)| matches_etag(stored, inm));
 
                 if etag_matches {
-                    return CacheDecision::NotModified { meta };
+                    // Return hit for cleanup by caller
+                    return (CacheDecision::NotModified { meta }, Some(hit));
                 }
 
                 // Check If-Modified-Since (only if no If-None-Match matched)
@@ -790,19 +811,23 @@ impl CacheDecision {
                     .is_some_and(|(ims, stored)| matches_if_modified_since(stored, ims));
 
                 if ims_matches {
-                    return CacheDecision::NotModified { meta };
+                    // Return hit for cleanup by caller
+                    return (CacheDecision::NotModified { meta }, Some(hit));
                 }
 
-                // No conditional match - serve from cache
-                CacheDecision::ServeFromCache { meta, hit }
+                // No conditional match - serve from cache (hit consumed by decision)
+                (CacheDecision::ServeFromCache { meta, hit }, None)
             }
 
-            LookupResult::Stale { meta, hit: _ } => {
-                // Stale entries always trigger revalidation (hit handler dropped)
-                CacheDecision::RevalidateWithOrigin { stale: Some(meta) }
+            LookupResult::Stale { meta, hit } => {
+                // Stale entries trigger revalidation; preserve hit for stale-if-error
+                (
+                    CacheDecision::RevalidateWithOrigin { stale: Some(meta) },
+                    Some(hit),
+                )
             }
 
-            LookupResult::Miss => CacheDecision::FetchFromOrigin,
+            LookupResult::Miss => (CacheDecision::FetchFromOrigin, None),
         }
     }
 }
@@ -1265,10 +1290,13 @@ mod tests {
     #[test]
     fn from_lookup_fresh_with_matching_etag() {
         let lookup = fresh_lookup(test_meta());
-        let decision = CacheDecision::from_lookup(lookup, Some(r#""abc123""#), None);
+        let (decision, returned_hit) =
+            CacheDecision::from_lookup(lookup, Some(r#""abc123""#), None);
         match decision {
             CacheDecision::NotModified { meta } => {
                 assert_eq!(meta.etag, Some(r#""abc123""#.to_string()));
+                // Hit returned for cleanup
+                assert!(returned_hit.is_some(), "hit should be returned for cleanup");
             }
             _ => panic!("Expected NotModified"),
         }
@@ -1278,7 +1306,7 @@ mod tests {
     fn from_lookup_fresh_with_matching_ims() {
         let lookup = fresh_lookup(test_meta());
         // Same date as stored Last-Modified
-        let decision =
+        let (decision, returned_hit) =
             CacheDecision::from_lookup(lookup, None, Some("Sun, 06 Nov 1994 08:49:37 GMT"));
         match decision {
             CacheDecision::NotModified { meta } => {
@@ -1286,6 +1314,8 @@ mod tests {
                     meta.last_modified,
                     Some("Sun, 06 Nov 1994 08:49:37 GMT".to_string())
                 );
+                // Hit returned for cleanup
+                assert!(returned_hit.is_some(), "hit should be returned for cleanup");
             }
             _ => panic!("Expected NotModified"),
         }
@@ -1296,13 +1326,15 @@ mod tests {
         // When both If-None-Match and If-Modified-Since are present,
         // If-None-Match takes precedence per RFC 7232 Section 6
         let lookup = fresh_lookup(test_meta());
-        let decision = CacheDecision::from_lookup(
+        let (decision, returned_hit) = CacheDecision::from_lookup(
             lookup,
             Some(r#""abc123""#),                   // Matching ETag
             Some("Sun, 06 Nov 1980 00:00:00 GMT"), // Would not match (stored is later)
         );
         match decision {
-            CacheDecision::NotModified { .. } => {}
+            CacheDecision::NotModified { .. } => {
+                assert!(returned_hit.is_some(), "hit should be returned for cleanup");
+            }
             _ => panic!("Expected NotModified (ETag match should take precedence)"),
         }
     }
@@ -1311,10 +1343,16 @@ mod tests {
     fn from_lookup_fresh_no_conditional_match() {
         let lookup = fresh_lookup(test_meta());
         // Non-matching ETag
-        let decision = CacheDecision::from_lookup(lookup, Some(r#""xyz789""#), None);
+        let (decision, returned_hit) =
+            CacheDecision::from_lookup(lookup, Some(r#""xyz789""#), None);
         match decision {
             CacheDecision::ServeFromCache { meta, .. } => {
                 assert_eq!(meta.etag, Some(r#""abc123""#.to_string()));
+                // Hit consumed by decision
+                assert!(
+                    returned_hit.is_none(),
+                    "hit should be consumed by ServeFromCache"
+                );
             }
             _ => panic!("Expected ServeFromCache"),
         }
@@ -1323,10 +1361,15 @@ mod tests {
     #[test]
     fn from_lookup_fresh_no_conditionals() {
         let lookup = fresh_lookup(test_meta());
-        let decision = CacheDecision::from_lookup(lookup, None, None);
+        let (decision, returned_hit) = CacheDecision::from_lookup(lookup, None, None);
         match decision {
             CacheDecision::ServeFromCache { meta, .. } => {
                 assert_eq!(meta.content_length, Some(100));
+                // Hit consumed by decision
+                assert!(
+                    returned_hit.is_none(),
+                    "hit should be consumed by ServeFromCache"
+                );
             }
             _ => panic!("Expected ServeFromCache"),
         }
@@ -1338,9 +1381,15 @@ mod tests {
         meta.etag = None;
         let lookup = fresh_lookup(meta);
         // If-None-Match provided but no stored ETag - should serve from cache
-        let decision = CacheDecision::from_lookup(lookup, Some(r#""abc123""#), None);
+        let (decision, returned_hit) =
+            CacheDecision::from_lookup(lookup, Some(r#""abc123""#), None);
         match decision {
-            CacheDecision::ServeFromCache { .. } => {}
+            CacheDecision::ServeFromCache { .. } => {
+                assert!(
+                    returned_hit.is_none(),
+                    "hit should be consumed by ServeFromCache"
+                );
+            }
             _ => panic!("Expected ServeFromCache when stored ETag is missing"),
         }
     }
@@ -1351,10 +1400,15 @@ mod tests {
         meta.last_modified = None;
         let lookup = fresh_lookup(meta);
         // If-Modified-Since provided but no stored Last-Modified - should serve from cache
-        let decision =
+        let (decision, returned_hit) =
             CacheDecision::from_lookup(lookup, None, Some("Sun, 06 Nov 1994 08:49:37 GMT"));
         match decision {
-            CacheDecision::ServeFromCache { .. } => {}
+            CacheDecision::ServeFromCache { .. } => {
+                assert!(
+                    returned_hit.is_none(),
+                    "hit should be consumed by ServeFromCache"
+                );
+            }
             _ => panic!("Expected ServeFromCache when stored Last-Modified is missing"),
         }
     }
@@ -1363,7 +1417,7 @@ mod tests {
     fn from_lookup_stale_ignores_conditionals() {
         let lookup = stale_lookup(test_meta());
         // Even with matching conditional headers, stale entries should revalidate
-        let decision = CacheDecision::from_lookup(
+        let (decision, returned_hit) = CacheDecision::from_lookup(
             lookup,
             Some(r#""abc123""#),                   // Would match if fresh
             Some("Sun, 06 Nov 1994 08:49:37 GMT"), // Would match if fresh
@@ -1372,6 +1426,11 @@ mod tests {
             CacheDecision::RevalidateWithOrigin { stale } => {
                 assert!(stale.is_some());
                 assert_eq!(stale.unwrap().etag, Some(r#""abc123""#.to_string()));
+                // Hit preserved for stale-if-error support
+                assert!(
+                    returned_hit.is_some(),
+                    "hit should be preserved for stale-if-error"
+                );
             }
             _ => panic!("Expected RevalidateWithOrigin"),
         }
@@ -1380,10 +1439,15 @@ mod tests {
     #[test]
     fn from_lookup_stale_no_conditionals() {
         let lookup = stale_lookup(test_meta());
-        let decision = CacheDecision::from_lookup(lookup, None, None);
+        let (decision, returned_hit) = CacheDecision::from_lookup(lookup, None, None);
         match decision {
             CacheDecision::RevalidateWithOrigin { stale } => {
                 assert!(stale.is_some());
+                // Hit preserved for stale-if-error support
+                assert!(
+                    returned_hit.is_some(),
+                    "hit should be preserved for stale-if-error"
+                );
             }
             _ => panic!("Expected RevalidateWithOrigin"),
         }
@@ -1391,9 +1455,11 @@ mod tests {
 
     #[test]
     fn from_lookup_miss() {
-        let decision = CacheDecision::from_lookup(LookupResult::Miss, None, None);
+        let (decision, returned_hit) = CacheDecision::from_lookup(LookupResult::Miss, None, None);
         match decision {
-            CacheDecision::FetchFromOrigin => {}
+            CacheDecision::FetchFromOrigin => {
+                assert!(returned_hit.is_none(), "no hit for cache miss");
+            }
             _ => panic!("Expected FetchFromOrigin"),
         }
     }
@@ -1401,13 +1467,15 @@ mod tests {
     #[test]
     fn from_lookup_miss_ignores_conditionals() {
         // Miss should return FetchFromOrigin regardless of client conditionals
-        let decision = CacheDecision::from_lookup(
+        let (decision, returned_hit) = CacheDecision::from_lookup(
             LookupResult::Miss,
             Some(r#""abc123""#),
             Some("Sun, 06 Nov 1994 08:49:37 GMT"),
         );
         match decision {
-            CacheDecision::FetchFromOrigin => {}
+            CacheDecision::FetchFromOrigin => {
+                assert!(returned_hit.is_none(), "no hit for cache miss");
+            }
             _ => panic!("Expected FetchFromOrigin"),
         }
     }
@@ -1415,9 +1483,11 @@ mod tests {
     #[test]
     fn from_lookup_fresh_wildcard_if_none_match() {
         let lookup = fresh_lookup(test_meta());
-        let decision = CacheDecision::from_lookup(lookup, Some("*"), None);
+        let (decision, returned_hit) = CacheDecision::from_lookup(lookup, Some("*"), None);
         match decision {
-            CacheDecision::NotModified { .. } => {}
+            CacheDecision::NotModified { .. } => {
+                assert!(returned_hit.is_some(), "hit should be returned for cleanup");
+            }
             _ => panic!("Expected NotModified for wildcard If-None-Match"),
         }
     }
@@ -1426,9 +1496,12 @@ mod tests {
     fn from_lookup_fresh_multiple_etags_one_matches() {
         let lookup = fresh_lookup(test_meta());
         // If-None-Match with multiple ETags, one matches stored
-        let decision = CacheDecision::from_lookup(lookup, Some(r#""foo", "abc123", "bar""#), None);
+        let (decision, returned_hit) =
+            CacheDecision::from_lookup(lookup, Some(r#""foo", "abc123", "bar""#), None);
         match decision {
-            CacheDecision::NotModified { .. } => {}
+            CacheDecision::NotModified { .. } => {
+                assert!(returned_hit.is_some(), "hit should be returned for cleanup");
+            }
             _ => panic!("Expected NotModified when one ETag matches"),
         }
     }
@@ -1437,13 +1510,18 @@ mod tests {
     fn from_lookup_fresh_ims_earlier_than_stored() {
         let lookup = fresh_lookup(test_meta());
         // Client's IMS is before stored Last-Modified - should serve from cache
-        let decision = CacheDecision::from_lookup(
+        let (decision, returned_hit) = CacheDecision::from_lookup(
             lookup,
             None,
             Some("Sun, 05 Nov 1994 08:49:37 GMT"), // Earlier than stored
         );
         match decision {
-            CacheDecision::ServeFromCache { .. } => {}
+            CacheDecision::ServeFromCache { .. } => {
+                assert!(
+                    returned_hit.is_none(),
+                    "hit should be consumed by ServeFromCache"
+                );
+            }
             _ => panic!("Expected ServeFromCache when IMS is earlier"),
         }
     }
@@ -1454,10 +1532,72 @@ mod tests {
         let mut meta = test_meta();
         meta.etag = Some(r#"W/"abc123""#.to_string());
         let lookup = fresh_lookup(meta);
-        let decision = CacheDecision::from_lookup(lookup, Some(r#""abc123""#), None);
+        let (decision, returned_hit) =
+            CacheDecision::from_lookup(lookup, Some(r#""abc123""#), None);
         match decision {
-            CacheDecision::NotModified { .. } => {}
+            CacheDecision::NotModified { .. } => {
+                assert!(returned_hit.is_some(), "hit should be returned for cleanup");
+            }
             _ => panic!("Expected NotModified via weak comparison"),
+        }
+    }
+
+    /// Mock HitHandler with actual body data for testing stale-if-error readability.
+    struct MockHitWithData {
+        chunks: Vec<Vec<u8>>,
+        pos: usize,
+    }
+
+    #[async_trait]
+    impl HitHandler for MockHitWithData {
+        async fn read_body(&mut self) -> crate::cache::CacheResult<Option<Vec<u8>>> {
+            if self.pos < self.chunks.len() {
+                let chunk = self.chunks[self.pos].clone();
+                self.pos += 1;
+                Ok(Some(chunk))
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn finish(self: Box<Self>) -> crate::cache::CacheResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn from_lookup_stale_hit_handler_is_readable() {
+        // Verify that the HitHandler returned for stale entries is actually usable
+        let meta = test_meta();
+        let hit: Box<dyn HitHandler> = Box::new(MockHitWithData {
+            chunks: vec![b"hello".to_vec(), b"world".to_vec()],
+            pos: 0,
+        });
+
+        let lookup = LookupResult::Stale {
+            meta: meta.clone(),
+            hit,
+        };
+        let (decision, stale_hit) = CacheDecision::from_lookup(lookup, None, None);
+
+        match decision {
+            CacheDecision::RevalidateWithOrigin { stale } => {
+                assert!(stale.is_some());
+                let mut hit = stale_hit.expect("stale_hit should be present");
+
+                // Verify we can read from the hit handler
+                let chunk1 = hit.read_body().await.unwrap();
+                assert_eq!(chunk1, Some(b"hello".to_vec()));
+
+                let chunk2 = hit.read_body().await.unwrap();
+                assert_eq!(chunk2, Some(b"world".to_vec()));
+
+                let chunk3 = hit.read_body().await.unwrap();
+                assert_eq!(chunk3, None);
+
+                hit.finish().await.unwrap();
+            }
+            _ => panic!("Expected RevalidateWithOrigin"),
         }
     }
 }
