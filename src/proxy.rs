@@ -172,6 +172,7 @@ impl ProxyHttp for ImageCacheProxy {
             match lookup_result {
                 LookupResult::Fresh { meta, hit } | LookupResult::Stale { meta, hit } => {
                     // Preserve hit for stale-if-error even in client no-cache path
+                    // TODO: Finish stale hits when strict client no-cache bypasses cache to avoid leaking HitHandler resources.
                     ctx.stale_meta = Some(meta);
                     ctx.stale_hit = Some(hit);
                     return Ok(false); // Continue to origin
