@@ -16,6 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/audit@v1
+        with:
+          # Only fail on actual vulnerabilities, not unmaintained crate warnings
+          denyWarnings: false
 
   fmt:
     name: Format
