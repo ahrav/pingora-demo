@@ -17,8 +17,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/audit@v1
         with:
-          # Only fail on actual vulnerabilities, not unmaintained crate warnings
-          denyWarnings: false
+          # Ignore protobuf vuln in Pingora 0.6.0 transitive deps (prometheus → protobuf 2.28.0)
+          # See: https://rustsec.org/advisories/RUSTSEC-2024-0437
+          ignore: RUSTSEC-2024-0437
 
   fmt:
     name: Format
