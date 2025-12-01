@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::{fmt, sync::Arc, time::Duration};
 
@@ -22,13 +21,14 @@ pub struct CacheKey {
 impl CacheKey {
     /// Create a new cache key from a URI path.
     ///
-    /// The path is hashed to produce a safe storage key that cannot
-    /// contain path traversal sequences like `..` or `/`.
+    /// The path is hashed using BLAKE3 to produce a stable, safe storage key
+    /// that cannot contain path traversal sequences like `..` or `/`.
+    /// The hash is truncated to 128 bits (32 hex chars) for a reasonable key length.
     pub fn new(path: &str) -> Self {
-        let mut hasher = DefaultHasher::new();
-        path.hash(&mut hasher);
-        let hash = hasher.finish();
-        let hashed_key = format!("idx-{hash:x}");
+        let hash = blake3::hash(path.as_bytes());
+        // Take first 16 bytes (128 bits) for 32 hex chars
+        let hash_bytes: [u8; 16] = hash.as_bytes()[..16].try_into().unwrap();
+        let hashed_key = format!("idx-{:032x}", u128::from_be_bytes(hash_bytes));
 
         Self {
             hashed: hashed_key.into_bytes(),
@@ -81,10 +81,10 @@ impl From<&str> for CacheKey {
 
 impl From<Vec<u8>> for CacheKey {
     fn from(value: Vec<u8>) -> Self {
-        let mut hasher = DefaultHasher::new();
-        value.hash(&mut hasher);
-        let hash = hasher.finish();
-        let hashed_key = format!("idx-{hash:x}");
+        let hash = blake3::hash(&value);
+        // Take first 16 bytes (128 bits) for 32 hex chars
+        let hash_bytes: [u8; 16] = hash.as_bytes()[..16].try_into().unwrap();
+        let hashed_key = format!("idx-{:032x}", u128::from_be_bytes(hash_bytes));
 
         Self {
             hashed: hashed_key.into_bytes(),
@@ -344,14 +344,34 @@ mod cache_key_tests {
 
     #[test]
     fn cache_key_format_is_consistent() {
-        // Verify the format is "idx-" followed by hex
+        // Verify the format is "idx-" followed by exactly 32 hex chars (128-bit BLAKE3)
         let key = CacheKey::from("/any/path");
         let key_str = std::str::from_utf8(key.as_slice()).unwrap();
 
         assert!(key_str.starts_with("idx-"));
 
-        // Everything after "idx-" should be valid hex
+        // Everything after "idx-" should be exactly 32 hex chars
         let hex_part = &key_str[4..];
+        assert_eq!(hex_part.len(), 32, "Hash should be 32 hex chars (128 bits)");
         assert!(hex_part.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn cache_key_hash_is_stable_blake3() {
+        // Pin known input/output to detect algorithm changes.
+        // This test will fail if the hash algorithm or truncation changes,
+        // which would break cache persistence across upgrades.
+        let key = CacheKey::from("/test/stability");
+        let key_str = std::str::from_utf8(key.as_slice()).unwrap();
+
+        // BLAKE3 hash of "/test/stability" truncated to 128 bits (first 16 bytes)
+        // Computed using: blake3::hash(b"/test/stability").as_bytes()[..16] as u128
+        let expected = "idx-1473ae5860a6e513d83ed7abd886864a";
+
+        assert_eq!(
+            key_str, expected,
+            "Hash output changed! This breaks cache persistence. \
+             If intentional, update this test with the new expected value."
+        );
     }
 }
